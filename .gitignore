@@ -15,3 +15,5 @@ __pycache__/
 *.swp
 *~
 .DS_Store
+src/perception/models/RLD_best.pth
+src/perception/models/UFLD_best.pth
