@@ -111,6 +111,10 @@ class StanleyNode(Node):
         self.right_veh = []
         self.speed     = 0.0
         self.last_log_time = 0.0
+        # Track HOLD-mode transitions so we log every entry/exit at WARN
+        # (not just the throttled per-second INFO). Makes the bridge
+        # pure-pursuit fallback's engagement legible.
+        self._prev_mode: str | None = None
 
         self.create_timer(1.0 / rate, self.control_loop)
         self.get_logger().info(
@@ -137,7 +141,14 @@ class StanleyNode(Node):
         lookahead = lane_center_at_lookahead(self.left_veh, self.right_veh,
                                              self.lookahead)
         if lookahead is None:
-            steer = 0.0
+            # HOLD: UFLD couldn't recover a lane centre at the lookahead
+            # distance — typically inside a junction or where the polylines
+            # are too short. We deliberately DO NOT publish /Car_1/cmd_steer
+            # here: the bridge's `is_steer_fresh()` then goes False and the
+            # pure-pursuit fallback (carlaaccsim/carlaAccSimTown.py) takes
+            # over for the junction. Stanley resumes the moment UFLD locks
+            # the ego-lane back up on the far side.
+            steer = float('nan')
             mode = 'HOLD'
             e_lat = e_head = float('nan')
         else:
@@ -151,10 +162,22 @@ class StanleyNode(Node):
                 e_head = math.atan2(dy, dx)
             steer = stanley_steer(e_lat, e_head, self.speed)
             mode = 'STANLEY'
+            out = Float32()
+            out.data = float(steer)
+            self.steer_pub.publish(out)
 
-        out = Float32()
-        out.data = float(steer)
-        self.steer_pub.publish(out)
+        # Edge-triggered log on HOLD ↔ STANLEY so the operator can see
+        # exactly when the bridge fallback should be engaging.
+        if mode != self._prev_mode:
+            if mode == 'HOLD':
+                self.get_logger().warn(
+                    f'HOLD — no lane centre at lookahead={self.lookahead} m '
+                    f'(left_pts={len(self.left_veh)}, right_pts={len(self.right_veh)}). '
+                    f'Stanley yielding; bridge pure-pursuit fallback should engage in '
+                    f'~200 ms.')
+            else:
+                self.get_logger().info('STANLEY re-engaged (lane re-acquired).')
+            self._prev_mode = mode
 
         now = self.get_clock().now().nanoseconds / 1e9
         if now - self.last_log_time > 1.0:

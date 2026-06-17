@@ -35,6 +35,8 @@ try:
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import CompressedImage
+    from geometry_msgs.msg import Twist
+    from std_msgs.msg import Float32, Float64
     CAMERA_AVAILABLE = True
     _camera_err = None
 except ImportError as e:
@@ -56,7 +58,27 @@ BRIDGE_SCRIPT = BRIDGE_DIR / 'carlaAccSimTown.py'
 START_ACC_SH  = ADAS_WK / 'start_acc.sh'
 ROS_SETUP     = '/opt/ros/humble/setup.bash'
 
-CAMERA_TOPIC  = '/Car_1/camera/front/compressed'
+CAMERA_TOPIC       = '/Car_1/camera/front/compressed'
+ACC_DEBUG_TOPIC    = '/ACC/perception/debug_image'
+LKAS_DEBUG_TOPIC   = '/LKAS/perception/debug_image'
+FUSED_DEBUG_TOPIC  = '/ADAS/perception/debug_image'
+CMD_VEL_TOPIC      = '/Car_1/cmd_vel'
+CMD_STEER_TOPIC    = '/Car_1/cmd_steer'
+SPEED_TOPIC        = '/Car_1/vehicle/speed'
+
+# Display-name → topic for the camera-source selector. The debug topics
+# carry YOLO bounding boxes (ACC), UFLD ego-lane polylines (LKAS), and the
+# combined view (ADAS) drawn server-side by the perception nodes.
+CAMERA_SOURCES = {
+    'Raw':            CAMERA_TOPIC,
+    'ACC (YOLO)':     ACC_DEBUG_TOPIC,
+    'LKAS (UFLD)':    LKAS_DEBUG_TOPIC,
+    'ADAS (YOLO+UFLD)': FUSED_DEBUG_TOPIC,
+}
+
+# A node is "alive" if its heartbeat topic has published within this window.
+NODE_ALIVE_WINDOW_S = 1.5
+
 # Tkinter doesn't enjoy a flood of PhotoImage swaps. Bridge publishes at
 # ~20 Hz; downsample to ~12 Hz for the widget.
 CAMERA_UI_HZ  = 12
@@ -159,24 +181,56 @@ print(f'[traffic] cleared {killed} NPCs')
 
 
 # --------------------------------------------------------------------------
-# ROS camera subscriber
+# ROS subscriber — camera sources + node heartbeats
 # --------------------------------------------------------------------------
-class CameraView(Node):
-    """Subscribes to the bridge's compressed camera topic and hands frames
-    (numpy RGB) to a callback."""
+class TelemetryView(Node):
+    """Subscribes to:
+      * the three camera-source topics (raw + ACC debug + LKAS debug) so the
+        UI can switch what it renders without tearing down subscriptions;
+      * the controller / Stanley command topics so the UI can show which
+        nodes are actually publishing (perception_node and lane_detection_node
+        are covered by the debug-image subs).
+    Camera frames are stashed as raw JPEG bytes; decode happens in the Tk
+    render tick so we only pay the cost for the source being shown. Every
+    received message also updates a last-seen timestamp so the UI can render
+    ACC / LKAS alive indicators.
+    """
 
-    def __init__(self, on_frame):
-        super().__init__('adas_ui_camera_view')
-        self.on_frame = on_frame
-        self.create_subscription(CompressedImage, CAMERA_TOPIC, self._cb, 10)
+    def __init__(self):
+        super().__init__('adas_ui_telemetry')
+        self.latest_jpegs = {t: None for t in CAMERA_SOURCES.values()}
+        self.last_seen: dict[str, float] = {}
+        # Ego speed in m/s. None until the bridge publishes a first sample.
+        self.speed_mps: float | None = None
 
-    def _cb(self, msg):
-        arr = np.frombuffer(msg.data, dtype=np.uint8)
-        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if bgr is None:
-            return
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        self.on_frame(rgb)
+        for topic in CAMERA_SOURCES.values():
+            self.create_subscription(
+                CompressedImage, topic,
+                lambda msg, t=topic: self._on_image(t, msg), 10)
+        self.create_subscription(
+            Twist, CMD_VEL_TOPIC,
+            lambda _msg: self._touch(CMD_VEL_TOPIC), 10)
+        self.create_subscription(
+            Float32, CMD_STEER_TOPIC,
+            lambda _msg: self._touch(CMD_STEER_TOPIC), 10)
+        self.create_subscription(
+            Float64, SPEED_TOPIC, self._on_speed, 10)
+
+    def _on_speed(self, msg):
+        self.speed_mps = float(msg.data)
+        self._touch(SPEED_TOPIC)
+
+    def _on_image(self, topic, msg):
+        # Stash raw bytes; let the render tick decide whether to decode.
+        self.latest_jpegs[topic] = bytes(msg.data)
+        self._touch(topic)
+
+    def _touch(self, topic: str):
+        self.last_seen[topic] = time.monotonic()
+
+    def is_alive(self, topic: str) -> bool:
+        ts = self.last_seen.get(topic)
+        return ts is not None and (time.monotonic() - ts) < NODE_ALIVE_WINDOW_S
 
 
 # --------------------------------------------------------------------------
@@ -197,13 +251,23 @@ class ADASUI:
         self.acc_on = False
         self.lkas_on = False
 
-        # ROS subscriber for the camera widget.
-        self.ros_node: CameraView | None = None
+        # ROS subscriber for the camera widget + node-alive heartbeats.
+        self.ros_node: TelemetryView | None = None
         self.ros_thread: threading.Thread | None = None
 
-        # Frame throttling.
-        self._latest_rgb = None
+        # Frame throttling + active source.
+        self._camera_source_var: tk.StringVar | None = None  # set in _build_ui
         self._render_after = None
+        self._last_rendered_jpeg: bytes | None = None  # avoid re-decoding the same frame
+        self._last_bgr: np.ndarray | None = None        # last decoded BGR frame (for video writer)
+
+        # Video recorder. None when idle; cv2.VideoWriter while recording.
+        # Records whatever the camera widget is currently showing — switching
+        # source mid-recording therefore changes what gets written, which is
+        # the natural UX (you record what you see).
+        self._video_writer: 'cv2.VideoWriter | None' = None
+        self._video_path: Path | None = None
+        self._video_size: tuple[int, int] | None = None  # (w, h) frozen at record start
 
         self._build_ui()
         self._start_camera_view()
@@ -278,27 +342,60 @@ class ADASUI:
             row=2, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop Bridge', command=self.stop_bridge).grid(
             row=2, column=1, sticky='ew', pady=2, padx=(4, 0))
+        # Sets BRIDGE_SYNC_MODE=1 in the bridge subprocess env at launch
+        # time. Applies on the next Start Bridge — toggling mid-run has
+        # no effect. See DEBUG.md §4 for why this is opt-in.
+        self.bridge_sync_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(procs,
+                        text='Bridge: synchronous mode (fixes flicker, may stall ego)',
+                        variable=self.bridge_sync_var).grid(
+            row=3, column=0, columnspan=2, sticky='w', pady=(0, 4))
         ttk.Button(procs, text='Run start_acc.sh', command=self.run_start_acc).grid(
-            row=3, column=0, columnspan=2, sticky='ew', pady=2)
-        ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
             row=4, column=0, columnspan=2, sticky='ew', pady=2)
+        ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
+            row=5, column=0, columnspan=2, sticky='ew', pady=2)
 
-        # Feature toggles.
+        # Feature toggles. Each row has a button (user intent — ON/OFF) and a
+        # small status dot reflecting whether the backing nodes are actually
+        # publishing on their heartbeat topics. Green = publishing, grey = silent.
         feats = ttk.LabelFrame(left, text='Features', padding=6)
         feats.grid(row=8, column=0, columnspan=2, sticky='ew', pady=(8, 0))
         feats.columnconfigure(0, weight=1)
         self.acc_btn = ttk.Button(feats, text='ACC: OFF', command=self.toggle_acc)
         self.acc_btn.grid(row=0, column=0, sticky='ew', pady=2)
+        self.acc_status_var = tk.StringVar(value='○ idle')
+        self.acc_status_lbl = ttk.Label(feats, textvariable=self.acc_status_var,
+                                         foreground='#888888', width=12)
+        self.acc_status_lbl.grid(row=0, column=1, sticky='w', padx=(6, 0))
         self.lkas_btn = ttk.Button(feats, text='LKAS: OFF', command=self.toggle_lkas)
         self.lkas_btn.grid(row=1, column=0, sticky='ew', pady=2)
+        self.lkas_status_var = tk.StringVar(value='○ idle')
+        self.lkas_status_lbl = ttk.Label(feats, textvariable=self.lkas_status_var,
+                                          foreground='#888888', width=12)
+        self.lkas_status_lbl.grid(row=1, column=1, sticky='w', padx=(6, 0))
+
+        # Recorder. Writes whatever the camera widget is currently showing
+        # (active source, decoded once per render tick) to a timestamped
+        # .mp4 in <workspace>/recordings/.
+        rec_frame = ttk.LabelFrame(left, text='Recording', padding=6)
+        rec_frame.grid(row=9, column=0, columnspan=2, sticky='ew', pady=(8, 0))
+        rec_frame.columnconfigure(0, weight=1)
+        self.record_btn = ttk.Button(rec_frame, text='● Record',
+                                     command=self._toggle_recording)
+        self.record_btn.grid(row=0, column=0, sticky='ew', pady=2)
+        self.record_status_var = tk.StringVar(value='idle')
+        self.record_status_lbl = ttk.Label(rec_frame,
+                                            textvariable=self.record_status_var,
+                                            foreground='#888888')
+        self.record_status_lbl.grid(row=1, column=0, sticky='w')
 
         # Status + clear-log.
         self.status_var = tk.StringVar(value='Ready')
         ttk.Label(left, textvariable=self.status_var, foreground='#0044aa',
                   wraplength=240).grid(
-            row=9, column=0, columnspan=2, sticky='w', pady=(10, 2))
+            row=10, column=0, columnspan=2, sticky='w', pady=(10, 2))
         ttk.Button(left, text='Clear log', command=self._clear_log).grid(
-            row=10, column=0, columnspan=2, sticky='ew', pady=2)
+            row=11, column=0, columnspan=2, sticky='ew', pady=2)
 
         # Right column: camera (top) + log (bottom).
         right = ttk.Frame(outer)
@@ -307,10 +404,31 @@ class ADASUI:
         right.rowconfigure(0, weight=3)
         right.rowconfigure(1, weight=2)
 
-        cam_frame = ttk.LabelFrame(right, text=f'Live camera — {CAMERA_TOPIC}', padding=4)
-        cam_frame.grid(row=0, column=0, sticky='nsew')
-        cam_frame.columnconfigure(0, weight=1)
-        cam_frame.rowconfigure(0, weight=1)
+        self._cam_frame = ttk.LabelFrame(right, text='Live camera', padding=4)
+        self._cam_frame.grid(row=0, column=0, sticky='nsew')
+        self._cam_frame.columnconfigure(0, weight=1)
+        self._cam_frame.rowconfigure(1, weight=1)
+
+        # Source selector — switches between raw bridge feed and the YOLO /
+        # UFLD / combined annotated debug images published by the perception
+        # nodes. The right side of the bar shows live ego speed.
+        src_bar = ttk.Frame(self._cam_frame)
+        src_bar.grid(row=0, column=0, sticky='ew', pady=(0, 4))
+        src_bar.columnconfigure(2, weight=1)
+        ttk.Label(src_bar, text='Source:').grid(row=0, column=0, sticky='w')
+        self._camera_source_var = tk.StringVar(value='Raw')
+        ttk.Combobox(src_bar, textvariable=self._camera_source_var,
+                     values=list(CAMERA_SOURCES.keys()),
+                     state='readonly', width=18).grid(
+            row=0, column=1, sticky='w', padx=(4, 0))
+        self._camera_source_var.trace_add('write', lambda *_: self._refresh_cam_title())
+
+        self.speed_var = tk.StringVar(value='Speed: —')
+        ttk.Label(src_bar, textvariable=self.speed_var,
+                  font=('Monospace', 11, 'bold'),
+                  foreground='#0044aa').grid(
+            row=0, column=2, sticky='e', padx=(8, 4))
+
         placeholder = ('waiting for first camera frame…'
                        if CAMERA_AVAILABLE
                        else f'camera disabled: {_camera_err}')
@@ -318,11 +436,12 @@ class ADASUI:
         # set. Hold the slot open with a pre-sized blank PhotoImage so the
         # widget has CAMERA_W × CAMERA_H pixels even before the first frame.
         self._placeholder_photo = tk.PhotoImage(width=CAMERA_W, height=CAMERA_H)
-        self.camera_label = tk.Label(cam_frame, background='#222222', anchor='center',
+        self.camera_label = tk.Label(self._cam_frame, background='#222222', anchor='center',
                                       text=placeholder, foreground='#aaaaaa',
                                       image=self._placeholder_photo, compound='center')
         self.camera_label.image = self._placeholder_photo
-        self.camera_label.grid(row=0, column=0, sticky='nsew')
+        self.camera_label.grid(row=1, column=0, sticky='nsew')
+        self._refresh_cam_title()
 
         log_frame = ttk.LabelFrame(right, text='Log', padding=4)
         log_frame.grid(row=1, column=0, sticky='nsew', pady=(6, 0))
@@ -354,24 +473,145 @@ class ADASUI:
         except RuntimeError:
             # Already initialised somewhere in this process.
             pass
-        self.ros_node = CameraView(self._on_frame_received)
+        self.ros_node = TelemetryView()
         self.ros_thread = threading.Thread(
             target=lambda: rclpy.spin(self.ros_node), daemon=True)
         self.ros_thread.start()
         # Schedule first render tick.
         self.root.after(int(1000 / CAMERA_UI_HZ), self._render_tick)
-        self._log(f'[ui] subscribed to {CAMERA_TOPIC} for live view')
+        self._log(
+            '[ui] subscribed to '
+            + ', '.join(CAMERA_SOURCES.values())
+            + f', {CMD_VEL_TOPIC}, {CMD_STEER_TOPIC}, {SPEED_TOPIC}')
 
-    def _on_frame_received(self, rgb):
-        # Called from rclpy spin thread — just stash the latest frame; the
-        # Tk after()-loop picks it up at CAMERA_UI_HZ.
-        self._latest_rgb = rgb
+    def _active_camera_topic(self) -> str:
+        name = self._camera_source_var.get() if self._camera_source_var else 'Raw'
+        return CAMERA_SOURCES.get(name, CAMERA_TOPIC)
+
+    def _refresh_cam_title(self):
+        # Show the active topic in the camera frame title so the user always
+        # knows which feed they're looking at.
+        topic = self._active_camera_topic()
+        if hasattr(self, '_cam_frame'):
+            self._cam_frame.configure(text=f'Live camera — {topic}')
 
     def _render_tick(self):
-        rgb = self._latest_rgb
-        if rgb is not None:
-            self._render_frame(rgb)
+        if self.ros_node is not None:
+            jpeg = self.ros_node.latest_jpegs.get(self._active_camera_topic())
+            if jpeg is not None and jpeg is not self._last_rendered_jpeg:
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if bgr is not None:
+                    self._last_bgr = bgr
+                    self._render_frame(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                    self._last_rendered_jpeg = jpeg
+            if self._video_writer is not None and self._last_bgr is not None:
+                self._record_frame(self._last_bgr)
+            self._refresh_status_dots()
+            self._refresh_speed_label()
         self.root.after(int(1000 / CAMERA_UI_HZ), self._render_tick)
+
+    def _refresh_speed_label(self):
+        v = self.ros_node.speed_mps if self.ros_node is not None else None
+        if v is None or not self.ros_node.is_alive(SPEED_TOPIC):
+            self.speed_var.set('Speed:  —  km/h')
+        else:
+            self.speed_var.set(f'Speed: {v * 3.6:5.1f} km/h')
+
+    # --------------------------------------------------------------------
+    # Video recorder
+    # --------------------------------------------------------------------
+    def _toggle_recording(self):
+        if self._video_writer is None:
+            self._start_recording()
+        else:
+            self._stop_recording()
+
+    def _start_recording(self):
+        if self._last_bgr is None:
+            self._log('[recorder] no camera frame yet — wait for the live '
+                      'feed and try again')
+            return
+        rec_dir = ADAS_WK / 'recordings'
+        rec_dir.mkdir(exist_ok=True)
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        source_tag = (self._camera_source_var.get()
+                      .lower().replace(' ', '_').replace('(', '').replace(')', '').replace('+', '_'))
+        self._video_path = rec_dir / f'adas_{ts}_{source_tag}.mp4'
+
+        h, w = self._last_bgr.shape[:2]
+        # mp4v is bundled with OpenCV's default build — no ffmpeg/H.264
+        # licensing dance. Acceptable quality for a UI preview recording.
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(
+            str(self._video_path), fourcc, float(CAMERA_UI_HZ), (w, h))
+        if not writer.isOpened():
+            self._log(f'[recorder] failed to open writer for '
+                      f'{self._video_path} ({w}×{h}@{CAMERA_UI_HZ})')
+            self._video_path = None
+            return
+        self._video_writer = writer
+        self._video_size = (w, h)
+        self.record_btn.configure(text='■ Stop')
+        self.record_status_var.set(f'● REC  →  {self._video_path.name}')
+        self.record_status_lbl.configure(foreground='#cc0000')
+        self._log(f'[recorder] recording {w}×{h}@{CAMERA_UI_HZ} fps → '
+                  f'{self._video_path}')
+
+    def _record_frame(self, bgr: np.ndarray):
+        # If the source switched and frame dims changed, resize to the
+        # writer's original size — VideoWriter requires a constant frame size.
+        h, w = bgr.shape[:2]
+        if (w, h) != self._video_size:
+            bgr = cv2.resize(bgr, self._video_size)
+        try:
+            self._video_writer.write(bgr)
+        except Exception as e:
+            self._log(f'[recorder] write failed: {e}; stopping recording')
+            self._stop_recording()
+
+    def _stop_recording(self):
+        if self._video_writer is None:
+            return
+        try:
+            self._video_writer.release()
+        except Exception:
+            pass
+        path = self._video_path
+        self._video_writer = None
+        self._video_path = None
+        self._video_size = None
+        self.record_btn.configure(text='● Record')
+        self.record_status_var.set(f'saved {path.name}' if path else 'idle')
+        self.record_status_lbl.configure(foreground='#1a9b3c' if path else '#888888')
+        self._log(f'[recorder] saved {path}')
+
+    def _refresh_status_dots(self):
+        # ACC is "active" when perception_node (publishes ACC debug image) AND
+        # controller_node (publishes /Car_1/cmd_vel) are both heartbeating.
+        # LKAS is "active" when lane_detection_node (publishes LKAS debug
+        # image) AND stanley_node (publishes /Car_1/cmd_steer) are both up.
+        node = self.ros_node
+        if node is None:
+            return
+        perc_alive = node.is_alive(ACC_DEBUG_TOPIC)
+        ctrl_alive = node.is_alive(CMD_VEL_TOPIC)
+        lane_alive = node.is_alive(LKAS_DEBUG_TOPIC)
+        stan_alive = node.is_alive(CMD_STEER_TOPIC)
+
+        def label(perc_ok: bool, ctrl_ok: bool) -> tuple[str, str]:
+            if perc_ok and ctrl_ok:
+                return ('● active', '#1a9b3c')
+            if perc_ok or ctrl_ok:
+                return ('◐ partial', '#cc8800')
+            return ('○ idle', '#888888')
+
+        text, colour = label(perc_alive, ctrl_alive)
+        self.acc_status_var.set(text)
+        self.acc_status_lbl.configure(foreground=colour)
+        text, colour = label(lane_alive, stan_alive)
+        self.lkas_status_var.set(text)
+        self.lkas_status_lbl.configure(foreground=colour)
 
     def _render_frame(self, rgb):
         # Resize to fit the camera widget (CAMERA_W × CAMERA_H), preserving
@@ -404,10 +644,16 @@ class ADASUI:
             pass
 
     def _popen(self, cmd, cwd=None, source_ros=False, source_workspace=False,
-               prefix='proc') -> subprocess.Popen:
+               prefix='proc', extra_env=None) -> subprocess.Popen:
         """Launch a subprocess in its own process group. If `source_ros` is
         true, the command is run under `bash -c` after sourcing ROS (and
-        optionally the ADAS workspace) so `rclpy` / `ros2 run` work."""
+        optionally the ADAS workspace) so `rclpy` / `ros2 run` work.
+        `extra_env` is merged on top of the current environment for the
+        child (used e.g. to inject BRIDGE_SYNC_MODE)."""
+        env = None
+        if extra_env:
+            env = os.environ.copy()
+            env.update(extra_env)
         if source_ros:
             parts = [f'source {shlex.quote(ROS_SETUP)}']
             if source_workspace and ADAS_INSTALL.exists():
@@ -415,13 +661,13 @@ class ADASUI:
             parts.append('exec ' + ' '.join(shlex.quote(s) for s in cmd))
             shell_cmd = ' && '.join(parts)
             proc = subprocess.Popen(
-                ['bash', '-c', shell_cmd], cwd=cwd,
+                ['bash', '-c', shell_cmd], cwd=cwd, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, start_new_session=True,
             )
         else:
             proc = subprocess.Popen(
-                cmd, cwd=cwd,
+                cmd, cwd=cwd, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, start_new_session=True,
             )
@@ -569,10 +815,13 @@ class ADASUI:
             self._log('[ui] Bridge already running')
             return
         cmd = [str(CARLA_PYTHON), str(BRIDGE_SCRIPT)]
-        self._log(f'$ (source ROS && cd {BRIDGE_DIR} && {" ".join(cmd)})')
+        extra_env = {'BRIDGE_SYNC_MODE': '1'} if self.bridge_sync_var.get() else None
+        env_note = ' (sync mode ON)' if extra_env else ''
+        self._log(f'$ (source ROS && cd {BRIDGE_DIR} && {" ".join(cmd)}){env_note}')
         self.bridge_proc = self._popen(cmd, cwd=str(BRIDGE_DIR),
-                                        source_ros=True, prefix='bridge')
-        self.status_var.set('Bridge starting')
+                                        source_ros=True, prefix='bridge',
+                                        extra_env=extra_env)
+        self.status_var.set('Bridge starting' + env_note)
 
     def stop_bridge(self):
         self._terminate(self.bridge_proc, 'Bridge')
@@ -671,7 +920,9 @@ def main():
     app = ADASUI(root)
 
     def on_close():
-        # Tear down what we own, in reverse-start order.
+        # Tear down what we own, in reverse-start order. Flush any in-flight
+        # video recording first so the .mp4 has a valid trailer.
+        app._stop_recording()
         app.stop_stack()
         app.stop_bridge()
         app.stop_carla()

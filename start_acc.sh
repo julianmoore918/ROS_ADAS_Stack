@@ -44,8 +44,13 @@ ros2 run controller stanley_node &
 STANLEY_PID=$!
 echo "[INFO] LKAS stanley_node started (PID $STANLEY_PID)"
 
+# ── Launch debug-image fusion (combined ACC + LKAS view) ─
+ros2 run perception debug_image_fusion_node &
+FUSION_PID=$!
+echo "[INFO] Debug-image fusion node started (PID $FUSION_PID)"
+
 # ── Shutdown handler ────────────────────────────────────
-PIDS="$PERCEPTION_PID $CONTROLLER_PID $LANE_DETECTION_PID $STANLEY_PID"
+PIDS="$PERCEPTION_PID $CONTROLLER_PID $LANE_DETECTION_PID $STANLEY_PID $FUSION_PID"
 trap "echo; echo '[INFO] Shutting down ADAS stack…'; kill $PIDS 2>/dev/null; exit 0" SIGINT SIGTERM
 
 wait

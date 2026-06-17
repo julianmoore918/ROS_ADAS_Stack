@@ -24,19 +24,24 @@ bridge:
   ∈ [-1, 1]).
 
 The bridge subscribes to both and merges them into a single
-`carla.VehicleControl` per command callback. When LKAS isn't running, steer
-stays at the bridge's last-seen value (0 on startup) and the system behaves
-as pure ACC; when ACC isn't running, throttle/brake stay at 0.
+`carla.VehicleControl` per command callback. When LKAS isn't running — or
+when Stanley enters `HOLD` mode (typically inside a junction, where UFLD
+loses the lanes) — the bridge falls back to a CARLA-side pure-pursuit
+controller that follows the ego's starting lane along a precomputed
+forward route. Stanley resumes the moment UFLD reacquires the lane on the
+junction exit. When ACC isn't running, throttle/brake stay at 0 and the
+car coasts.
 
 ## Workspace Structure
 
     ROS_ADAS_Stack/
-     ├── start_acc.sh               ← simulator startup script (launches all four nodes)
+     ├── start_acc.sh               ← simulator startup script (launches all five nodes)
      └── src/
          ├── perception/
-         │   ├── perception_node.py        (ACC — YOLO)
-         │   ├── lane_detection_node.py    (LKAS — UFLD V2)
-         │   └── models/                   (weights: best.pt, UFLD_best.pth, RLD_best.pth)
+         │   ├── perception_node.py             (ACC — YOLO)
+         │   ├── lane_detection_node.py         (LKAS — UFLD V2)
+         │   ├── debug_image_fusion_node.py     (combined YOLO + UFLD overlay)
+         │   └── models/                        (weights: best.pt, UFLD_best.pth, RLD_best.pth)
          └── controller/
              ├── controller_node.py        (ACC — throttle / brake)
              └── stanley_node.py           (LKAS — Stanley lateral controller, publishes /Car_1/cmd_steer)
@@ -120,6 +125,8 @@ Debug / visualization:
 
     /ACC/perception/debug_image        sensor_msgs/msg/CompressedImage    ← annotated YOLO detections
     /LKAS/perception/debug_image       sensor_msgs/msg/CompressedImage    ← annotated lane polylines
+    /ADAS/perception/debug_image       sensor_msgs/msg/CompressedImage    ← combined YOLO + UFLD overlay
+                                                                            (debug_image_fusion_node)
 
 ## Node Overview
 

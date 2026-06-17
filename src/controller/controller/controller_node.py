@@ -64,7 +64,12 @@ class ACCNode(Node):
         # ── ACC parameters ───────────────────────────────────────────────
         self.target_speed      = 20 / 3.6  # [m/s]
         self.d0                = 5.0       # standstill gap [m]
-        self.T_gap             = 1.5       # time gap [s]  →  d_desired = d0 + T_gap * v_ego
+        # d_desired = d0 + T_gap * v_ego. With T_gap=1.5 s the formula gave
+        # 13.4 m at 20 km/h cruise, so ACC began braking the moment YOLO saw
+        # a lead inside ~13 m — felt over-cautious for the demo. T_gap=0.5 s
+        # gives ~7.8 m at cruise (settling to d0=5 m at standstill), which
+        # matches the "follow at roughly 5 m" mental model.
+        self.T_gap             = 0.3
         self.k_p               = 1.2       # proportional gain
         self.k_d               = 0.8       # derivative gain
         self.a_max             = 3.0       # [m/s²]
@@ -76,7 +81,12 @@ class ACCNode(Node):
         self.THROTTLE_RATE_LIMIT = 0.05  # max throttle increase per step (20 Hz → 1.0 in ~1 second)
 
         # ── Distance filter ──────────────────────────────────────────────
-        self.ALPHA             = 0.01       # low-pass smoothing (0=max smooth, 1=no filter)
+        # Low-pass on /ACC/lead_vehicle_distance. ALPHA=0.01 effectively
+        # froze the filter (~100-sample memory at variable YOLO Hz), so
+        # the controller saw a stale "lots of room" reading and accelerated
+        # into the back of a closing lead. 0.4 gives ~3-sample (≈300 ms)
+        # response while still smoothing single-frame YOLO jitter.
+        self.ALPHA             = 0.4
         self.d_lead_filtered   = None
 
         # ── Internal state ───────────────────────────────────────────────

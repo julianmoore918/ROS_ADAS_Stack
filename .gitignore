@@ -3,6 +3,9 @@ build/
 install/
 log/
 
+# UI video recordings
+recordings/
+
 # Python caches
 __pycache__/
 *.py[cod]
