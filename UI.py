@@ -101,6 +101,15 @@ WEATHER_PRESETS = [
 
 TRAFFIC_OPTIONS = ['0', '5', '10', '20', '30', '50']
 
+# Junction policy — display name → bridge `--junction-policy` value. The
+# bridge's CARLA-map junction monitor revokes LKAS steer authority inside
+# any junction zone; the policy decides who owns steer instead. Mirrors
+# the `--policy` set in 00_Lane_Assistant/02_UFLD_V2/UI.py.
+JUNCTION_POLICIES = {
+    'Pure pursuit': 'pp-takeover',
+    'Hold straight': 'hold-straight',
+}
+
 
 # --------------------------------------------------------------------------
 # Helpers — CARLA-side state via the carla-env Python
@@ -177,6 +186,21 @@ for a in world.get_actors().filter('vehicle.*'):
         except Exception:
             pass
 print(f'[traffic] cleared {killed} NPCs')
+"""
+
+# Print every spawn point in the currently-loaded map. Format mirrors
+# the bridge's own --list-spawns flag so log output is consistent
+# whether you ask via UI or CLI.
+_LIST_SPAWNS_SNIPPET = """
+import carla, sys
+port = int(sys.argv[1])
+client = carla.Client('localhost', port); client.set_timeout(10.0)
+spawns = client.get_world().get_map().get_spawn_points()
+for i, sp in enumerate(spawns):
+    loc, rot = sp.location, sp.rotation
+    print(f'  {i:3d}  x={loc.x:8.2f}  y={loc.y:8.2f}  '
+          f'z={loc.z:6.2f}  yaw={rot.yaw:7.2f}')
+print(f'[spawns] {len(spawns)} spawn points')
 """
 
 
@@ -342,6 +366,22 @@ class ADASUI:
             row=2, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop Bridge', command=self.stop_bridge).grid(
             row=2, column=1, sticky='ew', pady=2, padx=(4, 0))
+        # Spawn index — passed as --spawn-index to the bridge at Start
+        # Bridge. Index into the current town's spawn_points list; the
+        # ego appears there and the lead `--lead-gap-m` ahead. Takes
+        # effect on the next Start Bridge. The "List" button dumps every
+        # spawn point (index, x, y, z, yaw) into the log so the user
+        # can pick one — CARLA must be running.
+        ttk.Label(procs, text='Spawn index:').grid(
+            row=3, column=0, sticky='w', pady=(0, 4))
+        spawn_frame = ttk.Frame(procs)
+        spawn_frame.grid(row=3, column=1, sticky='w', pady=(0, 4))
+        self.spawn_index_var = tk.StringVar(value='0')
+        ttk.Spinbox(spawn_frame, from_=0, to=999, width=6,
+                    textvariable=self.spawn_index_var).pack(side='left')
+        ttk.Button(spawn_frame, text='List',
+                   command=self.list_spawns, width=6).pack(
+            side='left', padx=(4, 0))
         # Sets BRIDGE_SYNC_MODE=1 in the bridge subprocess env at launch
         # time. Applies on the next Start Bridge — toggling mid-run has
         # no effect. See DEBUG.md §4 for why this is opt-in.
@@ -349,11 +389,21 @@ class ADASUI:
         ttk.Checkbutton(procs,
                         text='Bridge: synchronous mode (fixes flicker, may stall ego)',
                         variable=self.bridge_sync_var).grid(
-            row=3, column=0, columnspan=2, sticky='w', pady=(0, 4))
+            row=4, column=0, columnspan=2, sticky='w', pady=(0, 4))
+        # Junction policy — passed as --junction-policy to the bridge at
+        # Start Bridge. Switching mid-run has no effect; restart the bridge.
+        # See DEBUG.md §13.
+        ttk.Label(procs, text='Junction policy:').grid(
+            row=5, column=0, sticky='w', pady=(0, 4))
+        self.junction_policy_var = tk.StringVar(value='Pure pursuit')
+        ttk.Combobox(procs, textvariable=self.junction_policy_var,
+                     values=list(JUNCTION_POLICIES.keys()),
+                     state='readonly', width=14).grid(
+            row=5, column=1, sticky='w', pady=(0, 4))
         ttk.Button(procs, text='Run start_acc.sh', command=self.run_start_acc).grid(
-            row=4, column=0, columnspan=2, sticky='ew', pady=2)
+            row=6, column=0, columnspan=2, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
-            row=5, column=0, columnspan=2, sticky='ew', pady=2)
+            row=7, column=0, columnspan=2, sticky='ew', pady=2)
 
         # Feature toggles. Each row has a button (user intent — ON/OFF) and a
         # small status dot reflecting whether the backing nodes are actually
@@ -799,6 +849,11 @@ class ADASUI:
         self._log(f'[ui] clearing NPC traffic on port {port}')
         self._run_carla_snippet(_TRAFFIC_CLEAR_SNIPPET, [port], 'traffic')
 
+    def list_spawns(self):
+        port = self.port_var.get()
+        self._log(f'[ui] listing spawn points on port {port}')
+        self._run_carla_snippet(_LIST_SPAWNS_SNIPPET, [port], 'spawns')
+
     def stop_carla(self):
         # Always pkill — handles the case where CARLA was started outside the
         # UI and `self.carla_proc` is None.
@@ -814,14 +869,25 @@ class ADASUI:
         if self.bridge_proc and self.bridge_proc.poll() is None:
             self._log('[ui] Bridge already running')
             return
-        cmd = [str(CARLA_PYTHON), str(BRIDGE_SCRIPT)]
+        policy = JUNCTION_POLICIES.get(
+            self.junction_policy_var.get(), 'pp-takeover')
+        # The Spinbox value comes through as a string — let argparse on the
+        # bridge side parse it. If the user typed garbage, the bridge will
+        # error with a clear message; no client-side validation needed.
+        spawn_index = self.spawn_index_var.get().strip() or '0'
+        cmd = [str(CARLA_PYTHON), str(BRIDGE_SCRIPT),
+               '--junction-policy', policy,
+               '--spawn-index', spawn_index]
         extra_env = {'BRIDGE_SYNC_MODE': '1'} if self.bridge_sync_var.get() else None
         env_note = ' (sync mode ON)' if extra_env else ''
-        self._log(f'$ (source ROS && cd {BRIDGE_DIR} && {" ".join(cmd)}){env_note}')
+        self._log(f'$ (source ROS && cd {BRIDGE_DIR} && '
+                  f'{" ".join(cmd)}){env_note}')
         self.bridge_proc = self._popen(cmd, cwd=str(BRIDGE_DIR),
                                         source_ros=True, prefix='bridge',
                                         extra_env=extra_env)
-        self.status_var.set('Bridge starting' + env_note)
+        self.status_var.set(
+            f'Bridge starting (spawn={spawn_index}, '
+            f'junction: {policy}){env_note}')
 
     def stop_bridge(self):
         self._terminate(self.bridge_proc, 'Bridge')

@@ -12,10 +12,21 @@ Junction handling and the Stanley controller live in `stanley_node`.
 
 Subscribed topics:
     /Car_1/camera/front/compressed   (sensor_msgs/CompressedImage)
+    /Car_1/in_junction               (std_msgs/Bool)
+        Published by the bridge's junction monitor. While True, UFLD
+        inference is skipped — junction geometry (curbs, crosswalk
+        markings) is exactly where UFLD is least trustworthy, and the
+        bridge's pure-pursuit / hold-straight policies own steer
+        anyway. Empty Paths are emitted so Stanley enters HOLD and
+        stops fighting PP on cmd_steer.
 
 Published topics:
     /LKAS/ego_lane_left              (nav_msgs/Path)
     /LKAS/ego_lane_right             (nav_msgs/Path)
+        Vehicle-frame polylines (REP 103: X forward, Y left). Consumed
+        by stanley_node (lateral controller) and perception_node (ACC
+        lane-ROI filter — same IPM, same coordinate frame, no second
+        projection model).
     /LKAS/perception/debug_image     (sensor_msgs/CompressedImage)
 """
 
@@ -33,6 +44,7 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Bool
 
 
 # Camera intrinsics / extrinsics — defaults match the validate-script CARLA rig.
@@ -178,6 +190,11 @@ class LaneDetectionNode(Node):
         # ── I/O ──────────────────────────────────────────────────────────
         self.create_subscription(CompressedImage, cam_topic,
                                  self.camera_callback, 10)
+        # Bridge-published junction state. While True we skip UFLD
+        # inference and emit empty Paths — see module docstring.
+        self.create_subscription(Bool, '/Car_1/in_junction',
+                                 self._in_junction_cb, 1)
+        self._in_junction = False
         self.left_pub  = self.create_publisher(Path, 'ego_lane_left',  10)
         self.right_pub = self.create_publisher(Path, 'ego_lane_right', 10)
         self.debug_pub = self.create_publisher(CompressedImage,
@@ -187,6 +204,15 @@ class LaneDetectionNode(Node):
         self.cam_topic = cam_topic
         self.frame_count = 0
         self.create_timer(5.0, self._heartbeat)
+
+    def _in_junction_cb(self, msg: Bool):
+        was = self._in_junction
+        self._in_junction = bool(msg.data)
+        if self._in_junction != was:
+            state = 'ENTER' if self._in_junction else 'EXIT'
+            self.get_logger().info(
+                f'[junction] {state} — UFLD inference '
+                f'{"paused" if self._in_junction else "resumed"}')
 
     # ─────────────────────────────────────────────────────────────────────
     # Geometry: pixel → vehicle frame (REP 103 — Y is LEFT positive)
@@ -236,8 +262,6 @@ class LaneDetectionNode(Node):
             cv2.circle(out, (u, v), 4, (255, 80, 80), -1)
         for u, v in right_px:
             cv2.circle(out, (u, v), 4, (80, 255, 80), -1)
-        cv2.putText(out, f'L:{len(left_px)}  R:{len(right_px)}', (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
         return out
 
     # ─────────────────────────────────────────────────────────────────────
@@ -262,6 +286,27 @@ class LaneDetectionNode(Node):
             )
         self.frame_count += 1
         img_h, img_w = bgr.shape[:2]
+
+        # In a junction zone, emit empty Paths and the raw camera frame
+        # (with a "JUNCTION" overlay) instead of running UFLD. Stanley
+        # interprets empty Paths as HOLD and stops publishing cmd_steer,
+        # so the bridge's PP / hold-straight policies own steer cleanly.
+        if self._in_junction:
+            empty_header = msg.header
+            empty_header.frame_id = self.frame_id
+            self.left_pub.publish(self.to_path([], empty_header))
+            self.right_pub.publish(self.to_path([], empty_header))
+            overlay = bgr.copy()
+            cv2.putText(overlay, 'JUNCTION (UFLD paused)', (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+            _, buf = cv2.imencode('.jpg', overlay,
+                                  [cv2.IMWRITE_JPEG_QUALITY, 85])
+            dbg = CompressedImage()
+            dbg.header = msg.header
+            dbg.format = 'jpeg'
+            dbg.data = buf.tobytes()
+            self.debug_pub.publish(dbg)
+            return
 
         left_px, right_px = self.infer(bgr, img_w, img_h)
         left_veh  = self.polyline_to_vehicle(left_px,  img_w, img_h)

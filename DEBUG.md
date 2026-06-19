@@ -462,3 +462,277 @@ fused against a stale background).
   latest raw. That eliminates the overlay lag entirely. The current
   fix avoids the API changes by recovering the overlay from a pixel
   diff — cheap, but at the cost of small overlay lag.
+
+---
+
+## 9. Junction policy — map-based, supersedes §5 / §5b [FIXED]
+
+§5 and §5b above are the previous "Stanley yields on HOLD → fallback
+engages after 0.2 s" approach. It works when UFLD actually loses the
+lane inside a junction, but in practice UFLD often keeps producing
+*something* (curb lines, crosswalk markings) and Stanley stays in
+STANLEY mode through the intersection, steering against whatever
+garbage it sees.
+
+**Applied fix.** Lifted the CARLA-map-based junction detection from
+`00_Lane_Assistant/02_UFLD_V2/lkas_validate_0.9.16.py:junction_steer`
+and wired it into the bridge:
+
+1. `carlaAccSimTown.py` runs a `junction_monitor` thread at 10 Hz that
+   queries `world.get_map().get_waypoint(ego.location)` and decides
+   whether the ego is in (or approaching) a junction zone, using the
+   same `JUNCTION_ENTRY_LOOKAHEAD_M = 2.0` /
+   `JUNCTION_EXIT_LOOKAHEAD_M = 6.0` thresholds as lkas_validate.
+2. When in-junction, the monitor calls `avt_node.set_in_junction(True)`.
+3. `custom_ROS_pub_sub.CarlaAVT.is_steer_fresh()` now returns False
+   *unconditionally* while `_in_junction` is True — Stanley keeps
+   publishing, but its authority is revoked.
+4. The existing pure-pursuit fallback (via `should_apply=lambda: not
+   avt_node.is_steer_fresh()`) takes steer through the intersection
+   along `ego_route`. UFLD and Stanley continue to run; their cmd_steer
+   is just discarded for the junction window.
+5. `build_ego_route()` now picks the lane successor whose yaw is
+   closest to the current heading at each fork — i.e. "drive straight
+   through" by default — instead of the old `wp.next(2.0)[0]`
+   arbitrary-first-successor walker.
+
+This is the user's literal ask: *"use junction detection, switch off
+UFLD, use pure_pursuit.py as long as in junction"*. UFLD isn't
+literally killed — but its output is ignored — which is the same
+operational effect and avoids the complexity of stopping/starting a
+heavyweight inference node mid-run.
+
+The bridge prints `[junction] ENTER` / `EXIT` events to its stdout, so
+the operator can see the handoffs in the UI log.
+
+Switchable: `carlaAccSimTown.py --junction-policy none` reverts to the
+§5/5b heuristic (Stanley yields only when it actually enters HOLD).
+
+**Follow-ups (not done).**
+- Heading-aligned route picks "straight through" — to take a specific
+  turn at a specific junction we'd need a route planner on top of
+  `build_ego_route`, or a higher-level routing client.
+- The 2 m entry / 6 m exit constants are taken straight from
+  lkas_validate; if junctions in Town01 feel premature/late we can
+  expose those as flags too.
+
+---
+
+## 10. Bridge hard-coded for one scenario — now fully argparse-driven [FIXED]
+
+**Symptom.** Town, weather, vehicle blueprint, traffic count, camera
+resolution, spawn index were all module constants in
+`carlaaccsim/carlaAccSimTown.py`. The non-ROS validator
+`lkas_validate_0.9.16.py` had been argparse-driven from the start and
+ran cross-town / cross-weather smoothly; the bridge couldn't.
+
+**Applied fix.** Mirrored lkas_validate's argparse interface in the
+bridge. New flags (see `carlaaccsim/README.md` for the full table):
+
+- `--port`, `--town`, `--vehicle`, `--weather`, `--traffic`
+- `--lead-speed-pct`, `--lead-gap-m`
+- `--spawn-index`, `--list-spawns`
+- `--cam-width`, `--cam-height`, `--cam-fov`, `--cam-tick`
+- `--ego-route-len`
+- `--junction-policy {pp-takeover,none}`
+
+Defaults:
+- Camera bumped from **1280×720 → 1920×1080** to match the validator.
+  This roughly doubles the pixel count of a far-car bounding box and
+  improves YOLO distance accuracy at range, which contributed to the
+  Town03 early-brake behaviour we were seeing (§6 follow-up).
+- All other defaults preserve the previous hard-coded behaviour, so
+  running the bridge with no flags is the closest behavioural match to
+  the old script.
+
+**Related downstream fix.**
+`src/perception/perception/perception_node.py` was hard-coded for
+1280-wide imagery (`FOCAL_LENGTH = 640.0`). The distance formula now
+computes the focal length per frame from the actual image width and a
+ROS parameter `camera_fov_deg` (default 90), so distances stay
+correct at 1080p or any other resolution the bridge ships.
+
+**Follow-up (not done).**
+- The UI's "Start Bridge" button launches the bridge with no flags.
+  Threading the new flags through the UI (town selector → `--town`,
+  weather → `--weather`, traffic count → `--traffic`, junction
+  toggle → `--junction-policy`) is the next step.
+
+---
+
+## 11. Ego stalls at full ACC throttle — PP / bridge race on `apply_control` [FIXED]
+
+**Symptom.** With everything launched from the UI, `ros2 topic` showed
+ACC commanding `/Car_1/cmd_vel.linear.x = 1.0` (full throttle) at a
+steady 20 Hz, `/Car_1/vehicle/speed` publishing fine, no spin-thread
+exception in the bridge — but the ego sat at 0 m/s. New behaviour
+appeared after §9's map-based junction policy went live, but the root
+cause was an older latent bug exposed by it.
+
+**Root cause.** The pure-pursuit fallback's speed policy in
+[carlaaccsim/pure_pursuit_controller.py](../../carlaaccsim/pure_pursuit_controller.py)
+was reading throttle/brake back from CARLA, then re-applying them
+alongside its computed steer:
+
+```python
+def _ego_speed_policy(vehicle, speed, min_index):
+    ctrl = vehicle.get_control()    # ← effective control from PREVIOUS tick
+    return ctrl.throttle, ctrl.brake
+```
+
+`carla.Actor.get_control()` returns the effective control from the
+last physics step, not the latest queued `apply_control` call. Between
+ticks the bridge would receive ACC's `cmd_vel(throttle=1.0)` and
+queue a fresh `apply_control(throttle=1.0)`; PP would then tick a
+millisecond later, read `get_control().throttle = 0` (the still-effective
+prior-tick value), and queue `apply_control(throttle=0)`. The later
+queue entry wins per actor → CARLA applied throttle=0 for the next
+physics step. Car never moved.
+
+This race had always existed, but PP only engages when
+`is_steer_fresh()` is False — previously that meant just "LKAS isn't
+publishing", which was rare during normal demos. §9's junction monitor
+now flips `_in_junction=True` whenever the ego is in a junction zone,
+so PP started engaging at startup (Town03's `spawn_points[0]` happens
+to sit in a junction). PP then ran constantly and the throttle never
+got through.
+
+**Applied fix.** PP now reads throttle/brake from the *bridge's
+authoritative state* (the values most recently received on
+`/Car_1/cmd_vel`) instead of from `vehicle.get_control()`. Both threads
+agree on the same value, so even though PP queues its own
+`apply_control` after the bridge's, the throttle written is identical
+to what ACC commanded — the bridge's value survives. PP only owns
+steer in practice.
+
+The plumbing:
+- `custom_ROS_pub_sub.CarlaAVT.current_throttle_brake() → (throttle, brake)`
+  returns the most recent `cmd_vel` values.
+- `pure_pursuit_controller.run_pure_pursuit(..., throttle_brake_provider=callable)`
+  accepts an optional provider; when supplied, the speed policy calls
+  it instead of `get_control()`. `_ego_speed_policy` was refactored
+  into `_make_ego_speed_policy(throttle_brake_provider)`.
+- `carlaAccSimTown.py` passes
+  `throttle_brake_provider=avt_node.current_throttle_brake` when
+  starting the PP thread.
+
+`run_pure_escape` is unaffected — the lead vehicle has its own escape
+speed policy, no ROS handoff involved.
+
+**Caveat / follow-up.** This fix assumes the bridge's ROS callbacks
+(spin thread) are alive. If the spin thread dies for any reason,
+`current_throttle_brake()` returns the last value it saw before the
+crash — possibly stale 0. The earlier spin-exception hunt (still
+intermittent in heavy-traffic Town03 runs) remains an open thread
+above this in the stack.
+
+---
+
+## 12. Ego still stalls at full ACC throttle — bridge JPEG encoder starves the ROS executor at 1920×1080 [FIXED, with caveat]
+
+**Symptom.** After §11's fix went in we hit the same end-user symptom
+again: ACC publishing `/Car_1/cmd_vel.linear.x = 1.0` at a steady 20 Hz,
+Stanley publishing fresh `cmd_steer`, but the ego sat at 0 m/s. Visual
+camera feed showed no motion. Two diagnostic signatures gave the cause
+away:
+
+- `ros2 topic hz /Car_1/vehicle/speed` and `…/ACC/lead_vehicle_distance`
+  **timed out** even though `ros2 topic info` showed the bridge as the
+  publisher.
+- The bridge process was sitting at **117 % CPU** with no ADAS load.
+
+`/Car_1/cmd_vel` was alive and steady (ACC was healthy), but none of the
+bridge's *own* topics — speed, distance, the camera — were actually
+making it out to the wire. The bridge's spin thread was running but
+its callbacks weren't getting CPU.
+
+**Root cause.** `custom_ROS_pub_sub.CarlaAVT` uses a single-threaded
+ROS executor (`rclpy.executors.SingleThreadedExecutor`). Every
+subscription callback and every timer callback runs on the same
+thread. With the §10 camera bump to **1920 × 1080 at JPEG quality 95**,
+`_publish_camera` became expensive enough (~30–50 ms per frame; the
+inner `while not self.image_queue.empty()` drains any backlog in one
+call) that it monopolised the executor. `_cmd_vel_cb` then fired
+late or not at all, so the bridge's `self._throttle` stayed at its
+initial `0.0`. The pure-pursuit fallback's speed policy read that
+stale 0 via `current_throttle_brake()` (§11) and dutifully applied
+`apply_control(throttle=0, …)` to CARLA at 20 Hz. Car never moved.
+
+The reason §11's fix held under the validator but broke under the ROS
+stack is exactly the same load asymmetry: the validator runs as one
+process at low quality presets, the ROS stack runs the bridge alongside
+two GPU-heavy perception nodes that steal cycles and make the encoder
+fall further behind.
+
+**Applied fix.** Lowered the bridge's default camera resolution from
+1920×1080 to **1280×720** in
+[carlaaccsim/carlaAccSimTown.py:113-118](../../carlaaccsim/carlaAccSimTown.py#L113-L118).
+Encoding cost drops ~2.25× and the single-threaded executor regains
+enough headroom that `_cmd_vel_cb` fires on every message. The ego
+now moves the moment ACC commands throttle, confirmed end-to-end.
+
+**Caveats / follow-ups.**
+- The real fix is a multi-threaded executor in the bridge (or moving
+  JPEG encoding off the executor thread), so subscription callbacks
+  can run in parallel with image publishing. The resolution drop just
+  raises the load ceiling — at full traffic + perception load 1280p
+  may still creep up on it.
+- 1280p loses pixel area for YOLO at range. §6's follow-up about
+  pinhole distance accuracy at long range gets slightly worse.
+  Acceptable for now; the alternative was a non-moving car.
+- The bridge can still be run at 1920×1080 explicitly with
+  `--cam-width 1920 --cam-height 1080` — useful for offline dataset
+  capture where ACC throttle isn't in the loop.
+
+---
+
+## 13. Junction policy is now a UI choice (Pure pursuit / Hold straight) [DONE]
+
+**Background.** §9 added CARLA-map junction detection with one
+behaviour: inside a junction zone, the bridge sets `_in_junction =
+True`, `is_steer_fresh()` returns False, and the pure-pursuit fallback
+follows the precomputed `ego_route` through the intersection. That's
+fine when the ego is following a well-formed route, but for an
+X-junction where "drive straight through" is the right answer, holding
+`steer = 0` is simpler, needs no route, and avoids PP's wheel-overshoot
+on tight corners. The non-ROS validator at
+`00_Lane_Assistant/02_UFLD_V2/lkas_validate_0.9.16.py:320` already
+supported both via `--policy {hold-straight, map-follow, pure-pursuit,
+none}`, exposed in the validator's UI by a Combobox.
+
+**Applied changes.**
+
+- **Bridge.** `--junction-policy` choices extended from
+  `{none, pp-takeover}` to `{none, pp-takeover, hold-straight}` in
+  [carlaaccsim/carlaAccSimTown.py](../../carlaaccsim/carlaAccSimTown.py).
+  The junction monitor now passes the policy through to
+  `CarlaAVT.set_in_junction(in_junc, policy=…)`.
+- **CarlaAVT.** New `_junction_policy` field in
+  [carlaaccsim/custom_ROS_pub_sub.py](../../carlaaccsim/custom_ROS_pub_sub.py).
+  `is_steer_fresh()` returns True inside a junction under
+  `hold-straight` (so the PP fallback yields), False under
+  `pp-takeover` (so PP engages). `_apply_control()` clamps `steer = 0`
+  when in-junction under `hold-straight` — that overrides whatever
+  Stanley most recently published.
+- **UI.** New "Junction policy" combobox in
+  [UI.py](UI.py) Processes section with the two labels
+  *Pure pursuit* (maps to `pp-takeover`) and
+  *Hold straight* (maps to `hold-straight`). The chosen policy is
+  passed to the bridge as `--junction-policy <value>` at Start Bridge.
+  Switching mid-run has no effect — restart the bridge to apply.
+
+**Why no UI option for `none`.** The user's only ask was the two
+operational policies. `none` (LKAS keeps steer authority through
+junctions) is available on the command line for debugging but isn't
+useful in normal driving — it's the exact behaviour §5/§9 fixed by
+*not* letting LKAS steer against curbs and crosswalk markings.
+
+**Caveats / follow-ups.**
+- Like the sync-mode checkbox, the policy choice is baked into the
+  bridge subprocess at launch. A future improvement is a runtime ROS
+  parameter on `CarlaAVT` so the operator can hot-swap policies; the
+  scaffolding (`set_in_junction(policy=…)`) is in place for it.
+- `hold-straight` is genuinely "go straight" — at a T-junction where
+  the road bends, the car will drive into the kerb. Pick `pp-takeover`
+  in maps with frequent T-junctions; `hold-straight` shines on X-grid
+  towns (Town01/Town03 cores).
