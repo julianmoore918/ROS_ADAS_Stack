@@ -382,28 +382,20 @@ class ADASUI:
         ttk.Button(spawn_frame, text='List',
                    command=self.list_spawns, width=6).pack(
             side='left', padx=(4, 0))
-        # Sets BRIDGE_SYNC_MODE=1 in the bridge subprocess env at launch
-        # time. Applies on the next Start Bridge — toggling mid-run has
-        # no effect. See DEBUG.md §4 for why this is opt-in.
-        self.bridge_sync_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(procs,
-                        text='Bridge: synchronous mode (fixes flicker, may stall ego)',
-                        variable=self.bridge_sync_var).grid(
-            row=4, column=0, columnspan=2, sticky='w', pady=(0, 4))
         # Junction policy — passed as --junction-policy to the bridge at
         # Start Bridge. Switching mid-run has no effect; restart the bridge.
         # See DEBUG.md §13.
         ttk.Label(procs, text='Junction policy:').grid(
-            row=5, column=0, sticky='w', pady=(0, 4))
+            row=4, column=0, sticky='w', pady=(0, 4))
         self.junction_policy_var = tk.StringVar(value='Pure pursuit')
         ttk.Combobox(procs, textvariable=self.junction_policy_var,
                      values=list(JUNCTION_POLICIES.keys()),
                      state='readonly', width=14).grid(
-            row=5, column=1, sticky='w', pady=(0, 4))
+            row=4, column=1, sticky='w', pady=(0, 4))
         ttk.Button(procs, text='Run start_acc.sh', command=self.run_start_acc).grid(
-            row=6, column=0, columnspan=2, sticky='ew', pady=2)
+            row=5, column=0, columnspan=2, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
-            row=7, column=0, columnspan=2, sticky='ew', pady=2)
+            row=6, column=0, columnspan=2, sticky='ew', pady=2)
 
         # Feature toggles. Each row has a button (user intent — ON/OFF) and a
         # small status dot reflecting whether the backing nodes are actually
@@ -699,7 +691,7 @@ class ADASUI:
         true, the command is run under `bash -c` after sourcing ROS (and
         optionally the ADAS workspace) so `rclpy` / `ros2 run` work.
         `extra_env` is merged on top of the current environment for the
-        child (used e.g. to inject BRIDGE_SYNC_MODE)."""
+        child."""
         env = None
         if extra_env:
             env = os.environ.copy()
@@ -878,16 +870,11 @@ class ADASUI:
         cmd = [str(CARLA_PYTHON), str(BRIDGE_SCRIPT),
                '--junction-policy', policy,
                '--spawn-index', spawn_index]
-        extra_env = {'BRIDGE_SYNC_MODE': '1'} if self.bridge_sync_var.get() else None
-        env_note = ' (sync mode ON)' if extra_env else ''
-        self._log(f'$ (source ROS && cd {BRIDGE_DIR} && '
-                  f'{" ".join(cmd)}){env_note}')
+        self._log(f'$ (source ROS && cd {BRIDGE_DIR} && {" ".join(cmd)})')
         self.bridge_proc = self._popen(cmd, cwd=str(BRIDGE_DIR),
-                                        source_ros=True, prefix='bridge',
-                                        extra_env=extra_env)
+                                        source_ros=True, prefix='bridge')
         self.status_var.set(
-            f'Bridge starting (spawn={spawn_index}, '
-            f'junction: {policy}){env_note}')
+            f'Bridge starting (spawn={spawn_index}, junction: {policy})')
 
     def stop_bridge(self):
         self._terminate(self.bridge_proc, 'Bridge')
