@@ -269,6 +269,7 @@ class ADASUI:
         self.carla_proc: subprocess.Popen | None = None
         self.bridge_proc: subprocess.Popen | None = None
         self.stack_proc: subprocess.Popen | None = None         # start_acc.sh
+        self.foxglove_proc: subprocess.Popen | None = None      # foxglove_bridge
         self.acc_procs: list[subprocess.Popen] = []             # when toggled independently
         self.lkas_procs: list[subprocess.Popen] = []
 
@@ -396,6 +397,16 @@ class ADASUI:
             row=5, column=0, columnspan=2, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
             row=6, column=0, columnspan=2, sticky='ew', pady=2)
+        # Foxglove bridge — independent visualisation tool. Opens
+        # ws://localhost:8765 for Foxglove Studio (desktop or web).
+        # Lives outside the ADAS/CARLA lifecycle so layouts can also be
+        # used for rosbag playback after the stack is stopped.
+        ttk.Button(procs, text='Start Foxglove',
+                   command=self.start_foxglove).grid(
+            row=7, column=0, sticky='ew', pady=2)
+        ttk.Button(procs, text='Stop Foxglove',
+                   command=self.stop_foxglove).grid(
+            row=7, column=1, sticky='ew', pady=2, padx=(4, 0))
 
         # Feature toggles. Each row has a button (user intent — ON/OFF) and a
         # small status dot reflecting whether the backing nodes are actually
@@ -882,6 +893,25 @@ class ADASUI:
         self.status_var.set('Bridge stopped')
 
     # --------------------------------------------------------------------
+    # Foxglove bridge — ws://localhost:8765 for the Foxglove Studio app
+    # --------------------------------------------------------------------
+    def start_foxglove(self):
+        if self.foxglove_proc and self.foxglove_proc.poll() is None:
+            self._log('[ui] Foxglove bridge already running')
+            return
+        cmd = ['ros2', 'launch', 'foxglove_bridge',
+               'foxglove_bridge_launch.xml']
+        self._log(f'$ (source ROS && {" ".join(cmd)})')
+        self.foxglove_proc = self._popen(cmd, source_ros=True,
+                                          prefix='foxglove')
+        self.status_var.set('Foxglove bridge starting on ws://localhost:8765')
+
+    def stop_foxglove(self):
+        self._terminate(self.foxglove_proc, 'Foxglove bridge')
+        self.foxglove_proc = None
+        self.status_var.set('Foxglove bridge stopped')
+
+    # --------------------------------------------------------------------
     # start_acc.sh — launches all four ADAS nodes
     # --------------------------------------------------------------------
     def run_start_acc(self):
@@ -979,6 +1009,7 @@ def main():
         app.stop_stack()
         app.stop_bridge()
         app.stop_carla()
+        app.stop_foxglove()
         if app.ros_node is not None:
             try:
                 app.ros_node.destroy_node()
