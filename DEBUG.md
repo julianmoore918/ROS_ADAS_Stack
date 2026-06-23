@@ -736,3 +736,273 @@ useful in normal driving — it's the exact behaviour §5/§9 fixed by
   the road bends, the car will drive into the kerb. Pick `pp-takeover`
   in maps with frequent T-junctions; `hold-straight` shines on X-grid
   towns (Town01/Town03 cores).
+
+---
+
+## 14. Bonnet flicker is worse in Town10HD than Town03 [KNOWN, mitigation only]
+
+Operator-confirmed during demo: the §4 bonnet flicker visibly worsens
+when switching from Town03 to Town10HD. Same code, same bridge config,
+same camera resolution — only the map changes.
+
+**Why.** Town10HD is the high-density urban map and has roughly 2–3×
+the environment-object count of Town03. The flicker is Unreal's LOD
+picker resolving inconsistent state across multi-client commits
+between frames (see §4); the more meshes near the camera, the more
+likely the bad picks land on geometry that's visually prominent (and
+the bonnet is *right* in front of the camera). Town10HD also takes
+longer per frame on the same GPU, which widens the window during
+which the bridge / TrafficManager / UI snippets can race on
+`apply_*` calls — more race window means more inconsistent frames.
+
+**Mitigations (no fix, sync mode would have addressed it but
+regressed motion per §4).**
+- For demos that care about visual quality, default to **Town03**.
+- For Town10HD specifically: set **Quality: Low** in the UI dropdown
+  before Start CARLA. Low quality removes a lot of LOD tiers so
+  there's less to flicker between, and shortens frame time.
+- Combine Low quality with the 1280×720 bridge default (§12) for the
+  most stable look.
+- Avoid concurrent UI helper actions (Apply Weather, List spawns,
+  Spawn Traffic) while recording or screenshotting — each adds a
+  client that races on commits.
+
+---
+
+## 15. UFLD inference paused in junction + Stanley/PP cmd_steer race [FIXED]
+
+**Symptom.** With the §9/§13 junction policy active and
+`pp-takeover` selected, the operator could see the pure-pursuit
+fallback "kick" steer about once a second instead of the smooth 20 Hz
+control it produces outside junctions. UFLD continued running on
+junction frames (curbs, crosswalk markings) and Stanley kept
+publishing `/Car_1/cmd_steer` against that garbage, which felt wrong
+even though §9's `is_steer_fresh()` was supposed to override LKAS.
+
+**Two root causes**, both in the bridge's
+[carlaaccsim/custom_ROS_pub_sub.py](../../carlaaccsim/custom_ROS_pub_sub.py):
+
+1. **Bridge / PP `apply_control` race.** `_cmd_steer_cb` calls
+   `_apply_control()` on every Stanley publish (~20 Hz), writing
+   `(throttle, brake, Stanley_steer)` to CARLA. The pure-pursuit
+   thread runs its own 20 Hz loop and writes
+   `(throttle, brake, PP_steer)`. Whichever call lands closest to
+   the next physics tick wins. Roughly half the ticks Stanley's
+   stale steer beat PP's fresh value — that's the "1 Hz" feel.
+2. **Lane data was still flowing from junction frames.** UFLD ran on
+   every camera frame, including inside the junction box. Stanley
+   stayed in `STANLEY` mode (not HOLD) and kept publishing
+   `cmd_steer` against curbs/crosswalk lines — feeding the race
+   above with bogus values.
+
+**Applied fix.**
+
+- **Bridge.** `_apply_control()` early-returns when
+  `_in_junction and _junction_policy == 'pp-takeover'`. PP owns
+  apply_control exclusively in that window — it already writes
+  throttle/brake (via `current_throttle_brake()` per §11) and steer.
+  The Stanley write is dropped on the floor for the duration.
+- **Bridge.** New publisher `/Car_1/in_junction`
+  (`std_msgs/Bool`, depth 1) — published on every `set_in_junction`
+  call so downstream subscribers see ENTER/EXIT immediately.
+- **lane_detection_node.** Subscribes to `/Car_1/in_junction`. While
+  True, skips UFLD inference entirely; emits empty Paths on
+  `/LKAS/ego_lane_left` and `/LKAS/ego_lane_right` (Stanley reads
+  empty Paths as HOLD and stops publishing `cmd_steer`); publishes
+  the raw camera frame with a `JUNCTION (UFLD paused)` overlay on
+  `/LKAS/perception/debug_image` so the operator sees the pause.
+
+Net result: in a junction, PP is the only writer to
+`vehicle.apply_control`, Stanley is silent (HOLD), UFLD doesn't burn
+GPU cycles on frames it can't reason about, and the user-visible
+steer trace is a clean 20 Hz curve instead of a 1 Hz step.
+
+**Caveats / follow-ups.**
+- The Stanley HOLD message stops firing in the log while UFLD is
+  paused — Stanley simply sees no Paths. If you want a positive
+  "Stanley paused for junction" log signal, it has to come from
+  Stanley reacting to the same `/Car_1/in_junction` topic.
+
+---
+
+## 16. ACC lane ROI via UFLD vehicle-frame IPM [DONE]
+
+**Background.** Pre-existing ACC perception filtered YOLO detections
+to "within 20 % of image-centre horizontal", which is a crude
+substitute for "is this car in my lane". Cars in the adjacent lane
+near the image centre passed; cars in the ego lane at the periphery
+of the image (curving road) failed. With UFLD already producing the
+ego lane polylines, we can do better.
+
+**First attempt (replaced).** lane_detection published image-space
+polylines as `Float32MultiArray` on
+`/LKAS/ego_lane_{left,right}_px`; perception built a closed polygon
+and called `cv2.pointPolygonTest` on each detection's
+bottom-centre. Worked, but introduced a second coordinate frame
+(image space) for the same lane data Stanley was already consuming
+in vehicle frame.
+
+**Applied design.** Use the IPM that lane_detection already uses for
+Stanley. perception subscribes to `/LKAS/ego_lane_left` and
+`/LKAS/ego_lane_right` (`nav_msgs/Path`, vehicle frame, REP 103) and
+runs the same `ipm_pixel_to_vehicle` to ground-project each
+detection's bottom-centre into the road plane. A detection is
+in-lane iff its `Y_left` lies between the interpolated left and
+right lane Y at its `X_forward`. Same projection model, same
+coordinate frame, two consumers — no duplicated topics.
+
+- Files:
+  [src/perception/perception/perception_node.py](src/perception/perception/perception_node.py),
+  [src/perception/perception/lane_detection_node.py](src/perception/perception/lane_detection_node.py).
+- Camera extrinsics added as ROS parameters
+  `cam_height_m` (1.35) and `cam_x_offset` (0.6), matching the
+  bridge rig and lane_detection_node's existing defaults.
+- The image-space `_px` topics were removed — clean redesign.
+- Fallback: if either lane Path is empty (UFLD warm-up, junction
+  pause, or detection X beyond the polyline range), perception
+  falls back to the legacy centre-strip filter so ACC isn't blind.
+- The lane polygon was previously drawn on the ACC debug image; the
+  user asked for it to be removed so the ACC view stays focused on
+  YOLO boxes — the lane is already shown on the LKAS source.
+
+**Caveats / follow-ups.**
+- Both nodes hard-code the 1.35 m / 0.6 m camera rig. If the bridge
+  ever ships a different mount, both nodes' ROS parameters need to
+  be updated together. A bridge-published `/camera_info`-style
+  topic would centralise this.
+- IPM assumes a flat ground plane. On steep grade or speed bumps,
+  the projected (X, Y) gets noisy; we're not seeing this in CARLA
+  but real-world deployment would want a tilt-corrected variant.
+
+---
+
+## 17. Synchronous-mode UI control removed [DONE]
+
+§4's sync-mode opt-in was exposed in the UI as a checkbox. After
+§12's resolution fix landed and the ego stopped stalling in async
+mode, the operator never enabled sync mode in practice — flicker is
+tolerated in exchange for guaranteed motion. To reduce surface area
+and confusion, the UI control was retired:
+
+- Removed the `Bridge: synchronous mode` Checkbutton and its
+  `bridge_sync_var` BooleanVar from [UI.py](UI.py).
+- Removed the `BRIDGE_SYNC_MODE=1` env-var injection in
+  `start_bridge`.
+
+The bridge still honours `BRIDGE_SYNC_MODE=1` if set on the command
+line — kept as an escape hatch for flicker-only investigations. The
+UI just doesn't surface it any more. §4's post-mortem stays as-is;
+the feature isn't deleted, just hidden behind a CLI knob.
+
+---
+
+## 18. Foxglove Studio integration [DONE]
+
+The team uses Foxglove Studio for live telemetry visualisation.
+`foxglove_bridge` is a separate ROS 2 node that opens
+`ws://localhost:8765` for the Studio app to connect to — it's not
+auto-started by anything in the stack, so the operator had to
+remember to launch it manually each session and the saved layout
+would silently fail to connect.
+
+**Applied changes.**
+
+- Added **Start Foxglove** / **Stop Foxglove** buttons to the UI's
+  Processes group ([UI.py](UI.py)). Behind the scenes:
+  `ros2 launch foxglove_bridge foxglove_bridge_launch.xml`, streamed
+  into the UI log with the `[foxglove]` prefix.
+- The Foxglove process is independent of CARLA / Bridge / ADAS — it
+  can be started before any of them and stays up for rosbag playback
+  after the stack is torn down. Window-close also tears it down.
+
+**Recommended starter layout.**
+- 3-series Plot panel for cmd_vel.linear.x (throttle),
+  cmd_vel.linear.y (brake), cmd_steer.data (steer). Put throttle on
+  a separate Y-axis from velocity or it'll be crushed at the bottom
+  of a shared 0–5 m/s scale.
+- Indicator panel on `/Car_1/in_junction` — big colored block that
+  lights up on PP / hold-straight handoff.
+- Log panel filtered on `/rosout` — replaces grepping the UI log
+  for HOLD warnings, junction ENTER/EXIT prints, etc.
+- Image panels on `/ACC/perception/debug_image` and
+  `/LKAS/perception/debug_image` (and `/ADAS/perception/debug_image`
+  for the fused view if launched).
+
+**Caveats / follow-ups.**
+- Stanley logs `e_lat`, `e_head`, and STANLEY/HOLD mode as text
+  only — none of those are publishable today, so they can't be
+  plotted in Foxglove. Adding `/LKAS/stanley/e_lat`,
+  `/LKAS/stanley/e_head` (Float32) and `/LKAS/stanley/mode` (String
+  or enum) is ~5 lines in `stanley_node.py` and would give full
+  closed-loop lateral diagnostics from Foxglove.
+
+---
+
+## 19. IPM bird's-eye view — `ipm_view_node` [DONE]
+
+**Background.** The LKAS perception-debug image shows the lanes in
+*pixel space* of the forward camera: convenient for visual cross-
+check against the road, but hard to read distances off ("is that
+lane 30 m or 10 m away?"). We needed a top-down, metric view of the
+same lane geometry — both as a sanity check on the IPM the
+controllers consume, and as a foundation for future work that needs
+ground-plane reasoning (junction-lane mapping, lead detection in BEV,
+etc).
+
+**v1 — blank canvas with lane dots.** First pass at
+[src/perception/perception/ipm_view_node.py](src/perception/perception/ipm_view_node.py)
+just drew the `/LKAS/ego_lane_left` / `_right` polylines on a black
+canvas using `veh_to_bev` (the inverse of UFLD's IPM). Useful for
+showing *what UFLD believes the lanes are*, but couldn't show whether
+those beliefs matched the actual road — "straight UFLD line on
+curving road" and "straight UFLD line on straight road" looked the
+same.
+
+**v2 — warped camera + lane overlay [current].** Same node now
+warps the live `/Car_1/camera/front/compressed` frame to the BEV
+canvas using a fixed homography, then draws the UFLD polylines on
+top of the warped asphalt.
+
+- The homography is computed once per camera resolution from four
+  ground control points — a trapezoid at 5 m / 25 m forward × ±3 m
+  laterally — projected forward into the image with CARLA's pinhole
+  + the canonical extrinsics (camera height 1.35 m, x-offset 0.6 m,
+  FOV 90°). Same numbers as `lane_detection_node`'s IPM so the warp
+  and the polylines share a coordinate frame.
+- Re-computed automatically if the camera resolution changes (the
+  bridge can run at 720p or 1080p; §12).
+- Published on `/ADAS/ipm/debug_image` at 10 Hz so a Foxglove Image
+  panel can show it alongside the LKAS / ACC views.
+- The warp dims the road texture multiplicatively so the
+  blue/green UFLD overlays read clearly against the asphalt.
+
+**Why this is useful.**
+
+1. **Camera-calibration sanity check.** On straight road the warped
+   lane paint runs vertically (parallel to the image columns). If it
+   diverges with distance, the camera height / x-offset / FOV
+   constants are wrong — and the same constants drive ACC's lane-ROI
+   filter and Stanley's lateral error. Easier to spot it here than
+   to back it out of controller behaviour.
+2. **UFLD honesty check.** If UFLD's blue/green dots don't track the
+   *real* lane paint on the warped image, UFLD is hallucinating.
+3. **Foundation for junction-lane mapping.** Same homography can
+   project any vehicle-frame polyline — including `carla.Map`
+   junction waypoints — onto the same canvas, making it cheap to
+   visualise *every* drivable lane through a junction, not just the
+   one UFLD currently follows.
+
+**Caveats / follow-ups.**
+- IPM beyond ~25 m is unreliable. The ground-plane assumption breaks
+  on grades and the image-pixel quantisation amplifies (1 px maps
+  to many metres of ground at the horizon). The far-row control
+  point sits at 25 m for that reason; pushing it further would make
+  the near texture look correct but the far texture nonsensically
+  stretched.
+- The node is not wired into `setup.py` or `start_acc.sh` yet — run
+  directly with
+  `python3 src/perception/perception/ipm_view_node.py`. Add an
+  entry point if it becomes part of the regular launch.
+- `cv2.warpPerspective` at 10 Hz is cheap on the CPU side
+  (~ms-scale at the published 1280×720) and decouples cleanly from
+  the GPU-bound perception nodes. No load issue.
