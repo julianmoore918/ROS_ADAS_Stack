@@ -1,11 +1,15 @@
 # DEBUG / Known Issues
 
-Working notes on open bugs, regressions, and behavioural questions for the
-ADAS stack. Clean usage docs live in [README.md](README.md); this file is for
-"what's broken and what we still need to fix" only.
+Working notes on open bugs, regressions, behavioural questions, and
+design decisions for the ADAS stack. Clean usage docs live in
+[README.md](README.md); this file is the engineering record — what
+broke, why, and what we changed.
 
-Items marked **[FIXED]** have an applied patch; the description is kept so we
-remember what was wrong and why we changed it.
+Items marked **[FIXED]** have an applied patch; the description is
+kept so we remember what was wrong and why we changed it. **[DONE]**
+is a deliberate change (feature add, refactor). **[DECIDED]** is a
+non-code architectural call. **[KNOWN]** is an open limitation with
+mitigation. **[PLANNED]** is scoped but not started.
 
 > **Before every run after pulling code changes, rebuild:**
 > ```
@@ -18,6 +22,67 @@ remember what was wrong and why we changed it.
 > insidiously, running stale stanley / controller binaries whose log
 > output doesn't match the code in `src/` (e.g. HOLD printing
 > `steer=+0.000` instead of `steer=+nan`).
+
+---
+
+## Reading guide
+
+Two views over the same content:
+
+1. **Chronological dev log** — sections §1 onward, in the order
+   issues were encountered and resolved. Captures the *iteration
+   history*: a fix in §11 is later refined by §12, the junction
+   handling in §5 is superseded by §9 and §15, etc. Use this view
+   to understand "how we got here".
+2. **Thematic index** — below. Groups entries by subsystem.
+   Useful for thesis writing or anyone reading the document for
+   the first time.
+
+Every entry follows an evolving template that maps cleanly onto a
+thesis Objective / Methods / Results structure:
+
+| Section in entry            | Thesis correspondence            |
+|-----------------------------|----------------------------------|
+| Symptom / Background        | **Objective** — the problem      |
+| Root cause                  | **Analysis** — what we found     |
+| Applied fix / changes       | **Methods** — what we did        |
+| Caveats / follow-ups        | **Results / Discussion**         |
+
+---
+
+## Thematic index
+
+### Chapter 1 — System infrastructure & bridge
+- [§10](#10-bridge-hard-coded-for-one-scenario--now-fully-argparse-driven-fixed) Bridge — argparse-driven scenario configuration
+- [§4](#4-carla-graphics-flicker--ego-bonnet--npc-lods-unstable-partial--sync-mode-regressed-motion-now-opt-in) CARLA graphics flicker — sync vs. async investigation
+- [§12](#12-ego-still-stalls-at-full-acc-throttle--bridge-jpeg-encoder-starves-the-ros-executor-at-1920×1080-fixed-with-caveat) JPEG encoder starves the ROS executor at 1920×1080
+- [§17](#17-synchronous-mode-ui-control-removed-done) Synchronous-mode UI control removed
+- [§14](#14-bonnet-flicker-is-worse-in-town10hd-than-town03-known-mitigation-only) Bonnet flicker worse in Town10HD than Town03
+
+### Chapter 2 — Perception
+- [§2](#2-no-on-screen-indication-that-acc--lkas-are-running-fixed) On-screen indication that ACC / LKAS are running
+- [§6](#6-uncontrolled-acceleration--acc-ignores-closing-leads-ego-rear-ends-them-fixed) ACC distance-filter and gap tuning
+- [§7](#7-combined-yolo--ufld-topic-does-not-run-fixed--build-dependency--load-tuning) Combined YOLO + UFLD topic — build + load tuning
+- [§8](#8-combined-yolo--ufld-view-looks-like-two-overlapping-video-sequences-fixed) Combined view fusion — timestamp-matched overlays
+- [§16](#16-acc-lane-roi-via-ufld-vehicle-frame-ipm-done) ACC lane ROI via UFLD vehicle-frame IPM
+- [§20](#20-junction-lane-mapping--approaches-and-trade-offs-planned) Junction-lane mapping — approaches and trade-offs [PLANNED]
+
+### Chapter 3 — Control
+- [§1](#1-npc-traffic-does-not-follow-the-road--drives-straight-and-crashes-fixed) NPC traffic via TrafficManager autopilot
+- [§3](#3-fallback-behaviour-when-acc-or-lkas-is-off-decided) Fallback behaviour when ACC or LKAS is off
+- [§11](#11-ego-stalls-at-full-acc-throttle--pp--bridge-race-on-apply_control-fixed) PP / bridge `apply_control` race
+- [§15](#15-ufld-inference-paused-in-junction--stanleypp-cmd_steer-race-fixed) Stanley / PP cmd_steer race + UFLD pause
+
+### Chapter 4 — Junction policy (evolution over time)
+- [§5](#5-junction-policy--ufld-lane-drops-out-stanley-says-hold-car-still-steered-fixed-with-caveat) Stanley HOLD heuristic (v1)
+- [§5b](#5b-junction-policy-did-not-visibly-engage-in-testing--diagnostic-logging-added) Diagnostic logging
+- [§9](#9-junction-policy--map-based-supersedes-5--5b-fixed) Map-based junction policy (v2 — current)
+- [§13](#13-junction-policy-is-now-a-ui-choice-pure-pursuit--hold-straight-done) UI control: Pure-pursuit vs. Hold-straight
+- §15 (cross-listed under Chapter 3 — completes the handoff)
+
+### Chapter 5 — Tooling & visualisation
+- [§18](#18-foxglove-studio-integration-done) Foxglove Studio integration
+- [§19](#19-ipm-birds-eye-view--ipm_view_node-done) IPM bird's-eye view (`ipm_view_node`)
 
 ---
 
@@ -1006,3 +1071,164 @@ top of the warped asphalt.
 - `cv2.warpPerspective` at 10 Hz is cheap on the CPU side
   (~ms-scale at the published 1280×720) and decouples cleanly from
   the GPU-bound perception nodes. No load issue.
+
+---
+
+## 20. Junction-lane mapping — approaches and trade-offs [PLANNED]
+
+**Background.** The current junction stack ([§5](#5-junction-policy--ufld-lane-drops-out-stanley-says-hold-car-still-steered-fixed-with-caveat) →
+[§9](#9-junction-policy--map-based-supersedes-5--5b-fixed) →
+[§13](#13-junction-policy-is-now-a-ui-choice-pure-pursuit--hold-straight-done) →
+[§15](#15-ufld-inference-paused-in-junction--stanleypp-cmd_steer-race-fixed))
+suppresses UFLD inside junction zones and either holds steer = 0 or
+runs pure-pursuit along a *single* precomputed `ego_route`. This
+works *operationally* — the ego crosses an X-junction without
+straying — but it doesn't actually *map* the junction topology: we
+can't see every possible exit, can't pick a turn dynamically from a
+route plan, and can't verify post-junction that the ego ended up in
+a legal exit lane.
+
+To upgrade beyond a single hard-coded route we need a representation
+of **every drivable lane through the junction** in the ego's vehicle
+frame, refreshed online. Three families of approaches exist, in
+roughly increasing order of effort and decreasing reliance on prior
+information:
+
+### Approach A — CARLA Map API (sim-only, ground truth)
+
+CARLA exposes the full lane topology of the loaded town through its
+Python API: `world.get_map().get_topology()` returns every connected
+`(start_wp, end_wp)` lane pair in the map. For a junction
+specifically, `wp.get_junction()` retrieves the junction object and
+`junction.get_waypoints(carla.LaneType.Driving)` returns *every
+entry-exit waypoint pair through that junction* — left turn, right
+turn, straight, and any extra connectors.
+
+- **Method.** Detect the upcoming junction (the existing
+  `junction_monitor` already does this). At ENTER, query
+  `get_waypoints` for every entry-exit pair, walk each pair at 2 m
+  resolution to obtain polylines in *world* coordinates, transform
+  to *vehicle* frame using `ego.get_transform()`, hand the
+  polylines to the IPM node ([§19](#19-ipm-birds-eye-view--ipm_view_node-done))
+  for rendering — each path in a different colour.
+- **Effort.** ~50 lines, mostly in the bridge.
+- **Result.** Perfect lane topology in sim. Doesn't generalise to
+  real-world (no equivalent API).
+- **Right next step here** — it builds directly on what we already
+  have and shows immediately whether *visualising* every exit is
+  useful in the first place.
+
+### Approach B — Online camera-based BEV lane networks
+
+Train (or fine-tune) a neural network that takes the forward camera
+(or a multi-camera surround view) and outputs lane geometry directly
+in BEV. Modern state of the art:
+
+- **StreamMapNet** (Yuan et al., 2024) — transformer-based
+  encoder, temporal stream of BEV features, outputs **vector lanes**
+  with type labels (divider, boundary, centreline) in real time. The
+  user's intended thesis target.
+- **MapTR / MapTRv2** (Liao et al., 2022/2024) — earlier vector
+  lane networks; MapTRv2 added multi-class instances and is the
+  reference baseline.
+- **HDMapNet** (Li et al., 2022) — rasterized BEV semantic maps
+  + post-hoc vectorisation. Simpler but less direct.
+- **Lift-Splat-Shoot** (Philion & Fidler, 2020) — the lifting
+  backbone many BEV networks build on; gives a top-down feature map
+  from N cameras via per-pixel depth estimation.
+
+- **Method.** Replace `lane_detection_node`'s single-lane
+  UFLD output with a multi-lane vector head. In sim: train on
+  nuScenes / Argoverse-2 / Waymo Open Map for transfer, or
+  synthesise CARLA ground truth from Approach A's
+  `get_waypoints` calls (CARLA-native dataset, no domain gap, but
+  no real-world generalisation either).
+- **Effort.** Substantial — model architecture, training pipeline,
+  evaluation against ground truth, integration into the ROS stack.
+  Thesis-scope work.
+- **Result.** Generalises beyond CARLA (depending on training data),
+  no reliance on a pre-built map. State of the art for *online* HD-
+  map prediction.
+
+### Approach C — Pre-built HD maps (production reality)
+
+The map is recorded *offline* with a dedicated survey vehicle
+(LiDAR + GNSS-INS), aligned to centimetre scale, and shipped in the
+car. Online perception then mostly **localises in the map** and
+**confirms it is still valid** (construction, snow, repainted
+markings).
+
+- **Method.** Pre-record lane geometry for every junction the car
+  is allowed to operate in. At runtime, localise with high accuracy
+  (RTK-GNSS + IMU + LiDAR/vision feature matching) and look up the
+  junction's lane topology from the on-board HD map.
+- **Effort.** Lowest *online* compute, highest *offline* logistics:
+  survey vehicles, map storage, change-detection pipeline,
+  geographic restriction of the operational domain (ODD).
+- **Result.** Highest reliability, lowest ODD breadth. Not suitable
+  for a research project in CARLA, but it's what makes
+  Level-3-certified consumer systems (see below) possible today.
+
+### What current OEM ADAS systems use
+
+- **Tesla (FSD / AP, vision-only).** Single neural backbone
+  ("HydraNet") with multiple heads — among them vector lane
+  prediction, object detection, traffic-light state, drivable
+  space, and the more recent occupancy network for arbitrary 3D
+  obstacles. Eight cameras → BEV transformer → vector lanes. No
+  LiDAR, no radar, no HD map. Public direction is increasingly
+  end-to-end neural planning (cameras → control). Mobileye and
+  Wayve are pursuing similar.
+- **Mercedes Drive Pilot (Level 3, S-Class / EQS).** The opposite
+  philosophy: **HD map + LiDAR + radar + cameras + ultrasonic +
+  high-precision GNSS/IMU.** Operates *only* on pre-mapped highway
+  segments (Germany, Nevada, California) at up to 95 km/h. The HD
+  map provides lane topology; onboard perception confirms presence
+  of lane lines and vehicles and localises within centimetres.
+  Conservative ODD is the trade-off for Mercedes taking legal
+  liability while engaged.
+- **Waymo / Cruise / Mobileye Chauffeur.** Closer to Mercedes' end
+  — LiDAR + HD map + multi-modal perception, with neural BEV
+  networks layered on top for redundancy. Mobileye additionally
+  crowd-builds a thin HD map ("Road Experience Management") from
+  production-vehicle camera feeds while the car also runs
+  vision-only perception.
+
+The field is bifurcating into "vision-only, big-data, big-model" on
+one side (Tesla, Wayve, Mobileye SuperVision) and "HD-map + sensor-
+fusion, narrow ODD, certified" on the other (Mercedes, Waymo).
+Junction-lane mapping is where the two diverge most visibly:
+vision-only systems must *predict* it online; HD-map systems can
+*look it up*.
+
+### Recommended sequencing for this stack
+
+1. **Approach A first** (immediate, ~50 lines). Renders every
+   junction lane on the existing IPM BEV canvas. Validates the
+   visualisation + IPM math against ground truth before any
+   neural component is involved.
+2. **Approach B (StreamMapNet) for thesis novelty.** Synthesise
+   CARLA training data using Approach A as the labeller, train
+   StreamMapNet, replace UFLD's single-lane output with multi-lane
+   vector predictions. Compare against Approach A ground truth
+   inside CARLA; evaluate generalisation by additionally running
+   on a real-world dataset (nuScenes mini, OpenLane).
+3. **Approach C is out of scope** for a CARLA-only research
+   project, but worth a half-page in the thesis discussion as the
+   industrial reference point.
+
+**Open questions / decisions.**
+
+- *Training-data realism.* CARLA's camera and lane geometry have a
+  domain gap to real-world driving (lighting, weather variety,
+  marking deterioration). A CARLA-only-trained model may not
+  transfer. The mitigation is mixing CARLA + a real-world dataset,
+  or pre-training on real and fine-tuning on CARLA.
+- *Evaluation metric.* MapTR-family papers use Chamfer distance and
+  AP-by-class against vectorised ground truth. CARLA's
+  `get_waypoints` gives us perfect ground truth for free — no
+  manual labelling.
+- *Latency target.* If the StreamMapNet output feeds the same
+  Stanley / pure-pursuit hand-off as today's UFLD does, it needs to
+  meet ≥10 Hz with bounded latency. Real-time inference budget on
+  the dev GPU is the gating constraint.
