@@ -42,12 +42,12 @@ from sensor_msgs.msg import CompressedImage
 # ── BEV image / scale parameters ────────────────────────────────────────
 IMG_W            = 320      # pixels wide
 IMG_H            = 480      # pixels tall
-PX_PER_M         = 10.0     # 1 m on the ground = 10 px in the image
+PX_PER_M         = 15.0     # 1 m on the ground = 15 px in the image
 EGO_BOTTOM_PAD   = 20       # pixels of breathing room below the ego
 ORIGIN_X         = IMG_W // 2
 ORIGIN_Y         = IMG_H - EGO_BOTTOM_PAD
-FORWARD_MAX_M    = ORIGIN_Y / PX_PER_M                # ≈ 48 m forward
-LATERAL_MAX_M    = (IMG_W / 2) / PX_PER_M             # ≈ ±16 m lateral
+FORWARD_MAX_M    = ORIGIN_Y / PX_PER_M                # ≈ 30.7 m forward
+LATERAL_MAX_M    = (IMG_W / 2) / PX_PER_M             # ≈ ±10.7 m lateral
 
 # ── Camera intrinsics / extrinsics ──────────────────────────────────────
 # Must match the rig spawned by the bridge and used by
