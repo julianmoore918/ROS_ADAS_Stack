@@ -1072,6 +1072,119 @@ top of the warped asphalt.
   (~ms-scale at the published 1280×720) and decouples cleanly from
   the GPU-bound perception nodes. No load issue.
 
+### Methods note — interpolation kernel
+
+`cv2.warpPerspective` resamples the camera image at non-integer
+pixel positions dictated by the homography $H$. We use
+`cv2.INTER_LINEAR`; `cv2.INTER_CUBIC` was tested and gave no visible
+benefit on this view (the IPM is data-starved at the horizon, not
+interpolation-starved). Both kernels share the machinery of FEM
+shape functions on a uniform grid — useful framing for the thesis
+methods chapter.
+
+**1D linear interpolation.** Between samples $f_0,\ f_1$, with
+$t = (x - x_0)/(x_1 - x_0)\in[0,1]$:
+
+$$
+f(x) = (1-t)\, f_0 + t\, f_1
+$$
+
+The weights $(1-t)$ and $t$ are the **1D P1 Lagrange shape
+functions** $N_0,\ N_1$ — Kronecker-delta at the nodes
+($N_i(\xi_j) = \delta_{ij}$) and partition-of-unity
+($\sum N_i \equiv 1$). Same form as a 1D linear bar element.
+
+**2D bilinear (`INTER_LINEAR` for images).** Tensor product of the
+1D linear basis on a $2\times2$ source neighbourhood with corners
+$p_{00}, p_{10}, p_{01}, p_{11}$ at unit-square corners and
+$(u, v) \in [0,1]^2$:
+
+$$
+f(u, v) = p_{00}(1-u)(1-v) + p_{10}\,u(1-v) + p_{01}(1-u)v + p_{11}\,uv
+$$
+
+The four weights $\{(1-u)(1-v),\ u(1-v),\ (1-u)v,\ uv\}$ are
+**exactly** the **Q1 (bilinear quadrilateral) FEM shape functions**
+— this image-interpolation case is just the same element with the
+"mesh" being the regular pixel grid.
+
+**1D cubic (Keys / Catmull-Rom kernel).** Convolution against a
+4-tap kernel, sampling neighbours $f_{i-1}, f_i, f_{i+1}, f_{i+2}$
+around the floor $i = \lfloor x \rfloor$:
+
+$$
+f(x) = \sum_{k=-1}^{2} f_{i+k}\, W\bigl(x - (i+k)\bigr)
+$$
+
+with the Keys cubic kernel ($a = -\tfrac{1}{2}$ — OpenCV's default):
+
+$$
+W(s) = \begin{cases}
+(a+2)|s|^3 - (a+3)|s|^2 + 1, & |s| \le 1\\[2pt]
+a|s|^3 - 5a|s|^2 + 8a|s| - 4a, & 1 < |s| \le 2\\[2pt]
+0, & \text{otherwise}
+\end{cases}
+$$
+
+Equivalently, on the segment $t \in [0,1]$ between $f_0$ and $f_1$,
+the cubic Hermite form is:
+
+$$
+f(t) = f_0 H_{00}(t) + f'_0 H_{10}(t) + f_1 H_{01}(t) + f'_1 H_{11}(t)
+$$
+
+with the cubic Hermite shape functions
+
+$$
+H_{00}(t) = 2t^3 - 3t^2 + 1,\quad H_{10}(t) = t^3 - 2t^2 + t
+$$
+
+$$
+H_{01}(t) = -2t^3 + 3t^2,\quad H_{11}(t) = t^3 - t^2
+$$
+
+and slope estimates from central differences of neighbours
+
+$$
+f'_i \approx \frac{f_{i+1} - f_{i-1}}{2}.
+$$
+
+This is **identical to a 1D cubic Hermite FEM element**, with the
+difference that the FEM element gets its nodal derivatives from the
+analytical DOF list while image interpolation has to guess them
+from the pixel grid. The Keys kernel above and the Hermite +
+central-difference form are algebraically equivalent.
+
+**2D bicubic (`INTER_CUBIC` for images).** Tensor product on a
+$4\times4$ source neighbourhood:
+
+$$
+f(u, v) = \sum_{i=-1}^{2}\sum_{j=-1}^{2} f_{i,j}\, W(u-i)\, W(v-j)
+$$
+
+Sixteen weighted samples per output pixel, vs. four for bilinear —
+about 3-4× the compute. Sharper near edges in the source; very
+mild ringing artefacts ($C^1$ but the derivative isn't smooth, so
+the kernel has a slight negative lobe).
+
+**Continuity / FEM analogue summary.**
+
+| Image kernel        | FEM analog                                      | Continuity              |
+|---------------------|-------------------------------------------------|-------------------------|
+| `INTER_NEAREST`     | P0 piecewise-constant                           | $C^{-1}$ (jumps)        |
+| `INTER_LINEAR`      | P1 / Q1 Lagrange (linear / bilinear)            | $C^0$                   |
+| `INTER_CUBIC`       | Cubic Hermite + central-difference derivatives  | $C^1$                   |
+| `INTER_LANCZOS4`    | Truncated $\text{sinc}$ (spectral, non-local)   | $C^\infty$ in the limit |
+
+**Decision for this IPM.** Kept `INTER_LINEAR`. Bicubic helped only
+when the source had detail to preserve. The IPM's softness at the
+top of the image is **data-starvation** at the horizon (a tiny
+number of source pixels covering many BEV pixels), not an
+interpolation choice — `INTER_CUBIC` doesn't conjure information
+the camera didn't capture. Inside the 5-25 m IPM-trust zone the
+visual difference between LINEAR and CUBIC at this output
+resolution was negligible.
+
 ---
 
 ## 20. Junction-lane mapping — approaches and trade-offs [PLANNED]
