@@ -26,6 +26,7 @@ setup(
             'perception_node = perception.perception_node:main',
             'lane_detection_node = perception.lane_detection_node:main',
             'debug_image_fusion_node = perception.debug_image_fusion_node:main',
+            'ipm_view_node = perception.ipm_view_node:main',
         ],
     },
 )

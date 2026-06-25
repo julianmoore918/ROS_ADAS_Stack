@@ -23,6 +23,14 @@ Subscribed topics:
     /Car_1/camera/front/compressed   (sensor_msgs/CompressedImage)
     /LKAS/ego_lane_left              (nav_msgs/Path)
     /LKAS/ego_lane_right             (nav_msgs/Path)
+    /ACC/lead_bb_ground              (nav_msgs/Path) — 2-pose Path
+        with the IPM-projected bb-bottom-left and bb-bottom-right of
+        the closest in-lane lead from perception_node, in vehicle frame
+        (REP 103). Drawn as a horizontal red line on the BEV at the
+        lead's IPM-derived forward distance. See DEBUG §22.
+    /ACC/lead_vehicle_distance       (std_msgs/Float32) — used only
+        as the label text on that line so the BEV agrees with what
+        the controller is consuming.
 
 Published topics:
     /ADAS/ipm/debug_image            (sensor_msgs/CompressedImage)
@@ -37,6 +45,7 @@ from rclpy.node import Node
 
 from nav_msgs.msg import Path
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Float32
 
 
 # ── BEV image / scale parameters ────────────────────────────────────────
@@ -122,6 +131,18 @@ class IPMViewNode(Node):
         super().__init__('IPM_View_Node', namespace='ADAS')
         self.left_veh:  list[tuple[float, float]] = []
         self.right_veh: list[tuple[float, float]] = []
+        # Closest in-lane lead's bb-bottom edge, IPM-projected (vehicle
+        # frame). Pair of (X_fwd, Y_left). None when no in-lane lead is
+        # currently published. Paired with the scalar distance below so
+        # the BEV label matches what the controller is consuming.
+        self.lead_bb_ground: tuple[tuple[float, float],
+                                   tuple[float, float]] | None = None
+        self.lead_distance_m: float | None = None
+        # Interpolated centerline from perception_node's `_centerline_at`,
+        # sampled at 1 m intervals out to the polylines' extrapolated
+        # reach. Drawn in pure red so it stands out against the blue/green
+        # UFLD lane polylines and the warped asphalt.
+        self.centerline_veh: list[tuple[float, float]] = []
         self.latest_bgr: np.ndarray | None = None
         self.H: np.ndarray | None = None      # homography, lazy
         self.H_for_shape: tuple[int, int] | None = None  # (w, h) of H
@@ -133,6 +154,19 @@ class IPMViewNode(Node):
                                  self._on_left,  10)
         self.create_subscription(Path, '/LKAS/ego_lane_right',
                                  self._on_right, 10)
+        # The bb-bottom ground line (where the IPM thinks the lead's
+        # rear-ish ground contact is) plus the controller-facing scalar
+        # gap, both from perception_node. See DEBUG §22.
+        self.create_subscription(Path, '/ACC/lead_bb_ground',
+                                 self._on_lead_bb, 10)
+        self.create_subscription(Float32, '/ACC/lead_vehicle_distance',
+                                 self._on_lead_distance, 10)
+        # Interpolated centerline from perception_node's gate. Drawn
+        # in red so the operator can verify the in-lane corridor matches
+        # the actual road centre and see exactly where it stops (the X
+        # beyond which the gate drops detections).
+        self.create_subscription(Path, '/LKAS/centerline_debug',
+                                 self._on_centerline, 10)
         self.debug_pub = self.create_publisher(
             CompressedImage, 'ipm/debug_image', 10)
         self.create_timer(1.0 / PUB_HZ, self._publish)
@@ -164,6 +198,28 @@ class IPMViewNode(Node):
 
     def _on_right(self, msg: Path):
         self.right_veh = [
+            (p.pose.position.x, p.pose.position.y) for p in msg.poses]
+
+    def _on_lead_bb(self, msg: Path):
+        # perception_node publishes 2 poses (bb-bottom corners), or 0
+        # when no in-lane lead is currently detected.
+        if len(msg.poses) < 2:
+            self.lead_bb_ground = None
+            return
+        p_l = msg.poses[0].pose.position
+        p_r = msg.poses[1].pose.position
+        self.lead_bb_ground = ((p_l.x, p_l.y), (p_r.x, p_r.y))
+
+    def _on_lead_distance(self, msg: Float32):
+        d = msg.data
+        # PUBLISH_INF / d ≤ 0 → no usable detection. Clear the label so
+        # the BEV doesn't display a stale number against fresh geometry.
+        self.lead_distance_m = d if (d != float('inf') and d > 0.0) else None
+
+    def _on_centerline(self, msg: Path):
+        # REP 103: X forward, Y left. Empty Path → gate has no usable
+        # centerline this frame; the BEV will simply skip drawing it.
+        self.centerline_veh = [
             (p.pose.position.x, p.pose.position.y) for p in msg.poses]
 
     # ── Rendering ───────────────────────────────────────────────────────
@@ -207,6 +263,30 @@ class IPMViewNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                             (220, 220, 220), 1, cv2.LINE_AA)
 
+    def _draw_lead(self, img: np.ndarray):
+        """Draw the closest in-lane lead's bb-bottom ground line + the
+        distance label perception_node published. The two poses share
+        the same X_forward (both bb-bottom corners are at the same v),
+        so the BEV line is horizontal at the lead's range."""
+        if self.lead_bb_ground is None:
+            return
+        (x_l, y_l), (x_r, y_r) = self.lead_bb_ground
+        p_l = veh_to_bev(x_l, y_l)
+        p_r = veh_to_bev(x_r, y_r)
+        if p_l is None or p_r is None:
+            return
+        colour = (60, 60, 255)   # red — emphasis on the active ACC lead
+        cv2.line(img, p_l, p_r, colour, 2, cv2.LINE_AA)
+        cv2.circle(img, p_l, 4, colour, -1)
+        cv2.circle(img, p_r, 4, colour, -1)
+        if self.lead_distance_m is not None:
+            mid_u = (p_l[0] + p_r[0]) // 2
+            mid_v = (p_l[1] + p_r[1]) // 2
+            cv2.putText(img, f'{self.lead_distance_m:.1f} m gap',
+                        (mid_u + 8, mid_v - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                        colour, 1, cv2.LINE_AA)
+
     def _draw_ego(self, img: np.ndarray):
         # Small red wedge at the bottom — origin of the vehicle frame.
         cv2.rectangle(img,
@@ -225,6 +305,11 @@ class IPMViewNode(Node):
         # right green.
         self._draw_lane(img, self.left_veh,  (255, 80, 80))
         self._draw_lane(img, self.right_veh, (80, 255, 80))
+        # Interpolated centerline — pure red (BGR) so it pops against
+        # the blue/green lane lines. This is exactly what the in-lane
+        # gate in perception_node uses to accept/reject detections.
+        self._draw_lane(img, self.centerline_veh, (0, 0, 255))
+        self._draw_lead(img)
         self._draw_ego(img)
         cv2.putText(img, "IPM bird's-eye (vehicle frame)",
                     (6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4,

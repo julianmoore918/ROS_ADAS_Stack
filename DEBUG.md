@@ -66,6 +66,9 @@ thesis Objective / Methods / Results structure:
 - [§8](#8-combined-yolo--ufld-view-looks-like-two-overlapping-video-sequences-fixed) Combined view fusion — timestamp-matched overlays
 - [§16](#16-acc-lane-roi-via-ufld-vehicle-frame-ipm-done) ACC lane ROI via UFLD vehicle-frame IPM
 - [§20](#20-junction-lane-mapping--approaches-and-trade-offs-planned) Junction-lane mapping — approaches and trade-offs [PLANNED]
+- [§21](#21-adas-stack-near-cpu-capacity--ufld-diagnosis--rate-limit-fixed-with-planned-follow-up) ADAS stack near CPU capacity — UFLD diagnosis & rate limit
+- [§22](#22-lead-distance-pinhole--ipm-and-semantics--bumper-to-bumper-gap-fixed) Lead distance: pinhole → IPM and semantics → bumper-to-bumper gap
+- [§23](#23-anchor-based-loop-route-for-lead--pp-fallback-done) Anchor-based loop route for lead + PP fallback
 
 ### Chapter 3 — Control
 - [§1](#1-npc-traffic-does-not-follow-the-road--drives-straight-and-crashes-fixed) NPC traffic via TrafficManager autopilot
@@ -1064,10 +1067,11 @@ top of the warped asphalt.
   point sits at 25 m for that reason; pushing it further would make
   the near texture look correct but the far texture nonsensically
   stretched.
-- The node is not wired into `setup.py` or `start_acc.sh` yet — run
-  directly with
-  `python3 src/perception/perception/ipm_view_node.py`. Add an
-  entry point if it becomes part of the regular launch.
+- The node is now wired into `setup.py` (`ipm_view_node =
+  perception.ipm_view_node:main`) and `start_acc.sh` (launched
+  alongside the other perception nodes), so it comes up
+  automatically with the regular ADAS launch and shows up on
+  `/ADAS/ipm/debug_image` without any manual `python3` invocation.
 - `cv2.warpPerspective` at 10 Hz is cheap on the CPU side
   (~ms-scale at the published 1280×720) and decouples cleanly from
   the GPU-bound perception nodes. No load issue.
@@ -1345,3 +1349,519 @@ vision-only systems must *predict* it online; HD-map systems can
   Stanley / pure-pursuit hand-off as today's UFLD does, it needs to
   meet ≥10 Hz with bounded latency. Real-time inference budget on
   the dev GPU is the gating constraint.
+
+---
+
+## 21. ADAS stack near CPU capacity — UFLD diagnosis & rate limit [FIXED, with planned follow-up]
+
+**Symptom.** During normal operation the 28-core box ran with
+~50-80 % utilisation spread across roughly half the cores, load
+average climbed to ~19, and the UI / camera feed felt sluggish.
+Adding `ipm_view_node` to the regular launch ([§19](#19-ipm-birds-eye-view--ipm_view_node-done))
+pushed things further. The "fully exhausted" feel was a wide spread
+of cores at moderate utilisation rather than a few cores pinned at
+100 % — i.e. it was the *number of busy cores* that was the
+problem, not any single hot core.
+
+**Process audit (steady-state, before fixes).**
+
+| Process | CPU % (sustained) | Threads |
+|---|---|---|
+| CarlaUE4 | ~300 % | — |
+| **lane_detection_node** | **~660-980 %** | **114** |
+| perception_node | ~80 % | 68 |
+| debug_image_fusion | ~85 % | 65 |
+| foxglove_bridge (relay) | ~80 % | — |
+| ipm_view_node | ~25 % | 92 |
+
+GPU was at 45 % utilisation with 3 GB used by UFLD — i.e. the model
+was on GPU as intended; the CPU cost was *plumbing around the GPU*,
+not inference itself. `lane_detection_node` was the obvious top
+target; three independent contributors compounded.
+
+### 21a. UFLD model-load CPU spike — `map_location=device` [FIXED]
+
+**Root cause.** `torch.load('UFLD_best.pth', map_location='cpu')`
+deserialises the 1.7 GB state dict into CPU RAM, then `.to(device)`
+copies the same data to GPU. Two costs: (i) a multi-threaded
+deserialise + allocate burst (measured 770 % CPU on a 23-second-old
+process — ~177 CPU-seconds of work in 23 wall-seconds), and (ii) a
+transient 1.7 GB RAM footprint that pushed the box into swap
+(~1.9 GB swap in use during cold start).
+
+**Applied fix.**
+[lane_detection_node.py:90](src/perception/perception/lane_detection_node.py#L90).
+`map_location='cpu'` → `map_location=device`. Weights land directly
+on GPU, no CPU-resident copy, no redundant CPU→GPU transfer. The
+subsequent `net.eval().to(device)` becomes a no-op for the device
+move but is kept (`.eval()` is still needed to put BN/dropout into
+eval mode). Inference output is bit-for-bit identical.
+
+Measured drop: 770 % → 218 % at age-23 s after restart. Cold-start
+swap pressure halved (1.9 GB → 1.0 GB). The `torch.load(..., mmap=True,
+weights_only=True)` flags were considered as additional sharpenings
+but not applied — `map_location=device` alone solved the symptom.
+
+### 21b. Thread-pool sprawl — cap all parallel libraries [FIXED]
+
+**Root cause.** Even after §21a, `lane_detection_node` still ran 114
+threads with 16-20 in R-state during inference bursts, burning ~7
+cores at steady state. Every parallel library in the stack —
+PyTorch intra-op, PyTorch inter-op, OpenCV, OpenMP, MKL, OpenBLAS,
+NumExpr — defaults its thread pool to the number of physical cores.
+On a 28-core box each library happily spawns its own ~28 workers.
+None of those defaults are visible to each other, so capping
+`torch.set_num_threads()` only addresses ~1/N of the actual
+parallelism.
+
+**Applied fix.** Cap every relevant pool at 2 threads at module
+import time, *before* any third-party import. Applied in both
+[lane_detection_node.py](src/perception/perception/lane_detection_node.py)
+and [perception_node.py](src/perception/perception/perception_node.py):
+
+```python
+import os
+os.environ.setdefault('OMP_NUM_THREADS',      '2')
+os.environ.setdefault('MKL_NUM_THREADS',      '2')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '2')
+os.environ.setdefault('NUMEXPR_NUM_THREADS',  '2')
+
+import cv2
+cv2.setNumThreads(2)
+
+import torch
+torch.set_num_threads(2)
+torch.set_num_interop_threads(2)
+```
+
+Ordering matters: the env vars must precede the first `import
+numpy / cv2 / torch / ultralytics`, because those libraries read the
+env vars at import time to size their thread pools.
+`perception_node.py` originally had the env vars *after* `from
+ultralytics import YOLO`, which silently negated them — fixed in
+the same pass by reordering imports so all env setup happens first.
+
+Measured effect: system idle jumped from 29 % → 74 % at one
+snapshot, the per-core spread tightened (no more 21 simultaneous
+R-state threads), and bursts dropped from "always-on" to
+intermittent. Wall-time CPU consumption did *not* drop in
+proportion to thread count — each inference still does the same
+total work — but the cap reduced the **spread** of concurrent
+activity across cores, which is what made the box feel responsive
+again.
+
+### 21c. Drop UFLD inference rate — `inference_skip_n` (Option A) [FIXED]
+
+**Root cause.** With §21a + §21b applied, the residual sustained
+load was dominated by ~140 small tensor operations per frame inside
+[UFLDInference.__call__](src/perception/perception/lane_detection_node.py#L114-L149)
+— a Python loop over `num_cls_row` row anchors, each iteration
+creating tiny tensors and calling `softmax`, elementwise multiply,
+`sum`, `.item()`. At 20 Hz camera input that's ~2,800 torch ops/sec,
+each with per-op thread-pool startup overhead. The CPU load was
+*overhead-bound*, not math-bound.
+
+**Applied fix.** Process only every Nth camera frame.
+`lane_detection_node` got a new ROS parameter `inference_skip_n`
+(default `4`), and `camera_callback` early-returns on
+`(frame_count - 1) % skip_n != 0` *before* `cv2.imdecode`, so JPEG
+decode, preprocess, UFLD forward, post-process and JPEG encode are
+all skipped on the dropped 3 of 4 frames. Frame 1 always processes
+so the first-frame log fires immediately.
+
+UFLD effective rate: 20 Hz → 5 Hz. The polyline topics
+`/LKAS/ego_lane_left/right` drop to 5 Hz, but Stanley reads the
+latest cached `Path` on its own 20 Hz tick — Stanley's output rate
+is unchanged.
+
+**Performance impact on lateral control.** Lane data is at most
+`200 ms` stale at 5 Hz UFLD vs `50 ms` at 20 Hz. At the controller's
+20 km/h cruise target (`5.5 m/s`), that's `1.1 m` of vehicle travel
+between updates — well within lane width and the actuator response
+window. On a sweeping curve the steer trace shows small step-shaped
+chatter at lane-update boundaries; on straight road it is
+imperceptible. At higher speeds (e.g. 60 km/h ≈ 16.7 m/s, 3.3 m
+between updates) the trade-off is no longer free — set
+`inference_skip_n:=2` (10 Hz) for the middle ground, or `:=1`
+(20 Hz, no skip) on launch.
+
+Runtime override (no rebuild):
+```
+ros2 run perception lane_detection_node --ros-args -p inference_skip_n:=2
+```
+
+Final measured state (with §21a + §21b + §21c): per-core CPU stays
+under ~80 %, no cores pinned at 100 %, load average dropped from
+18+ into single digits, system feels responsive.
+
+### Caveats / follow-ups
+
+- **Option B — vectorise the polyline loop [PLANNED].** The
+  fundamental fix is to replace the per-row-anchor Python loop in
+  [UFLDInference.__call__](src/perception/perception/lane_detection_node.py#L114-L149)
+  with a single vectorised pass: compute `softmax` along the entire
+  `loc_row` grid axis once, compute the weighted sum over a centred
+  3-cell window for every `(row, lane)` pair in a batched tensor op,
+  then mask by `valid` and convert to Python only at the very end.
+  Expected ~50 % drop in steady-state CPU on top of Option A, and a
+  path back to running at full 20 Hz UFLD without saturating cores.
+  Estimated ~20 lines in `__call__`. Not done in this iteration
+  because Option A already brought the box back into headroom.
+  Worth doing before raising the operating speed target above
+  ~30 km/h, where 5 Hz lane updates start to look stale.
+- **`/proc/$PID/environ` does not reflect runtime `os.environ`
+  edits.** Sanity-checking the §21b caps via `tr '\0' '\n' <
+  /proc/$PID/environ` shows nothing — that's expected (`/proc/environ`
+  is fixed at fork time) and is *not* proof the caps failed. To
+  verify the caps inside the process, log them at startup:
+  `self.get_logger().info(f"threads: torch={torch.get_num_threads()}
+  cv2={cv2.getNumThreads()}")`.
+- **Foxglove bridge (~75-130 %) is the remaining big non-CARLA CPU
+  consumer.** Closing the Foxglove Studio panel collapses that to
+  ~5 %. Not part of this fix but the easiest further win when
+  iterating — and reinforces the §18 note that Foxglove should be
+  started/stopped on demand, not left running.
+- **`adas-rebuild` shell alias.** Added to `~/.bashrc` during this
+  iteration: `(cd ROS_ADAS_Stack && source /opt/ros/humble/setup.bash
+  && colcon build --packages-select perception controller)`. Uses a
+  subshell so the user's working directory is not affected. The
+  install is a hard copy, not a symlink — `--symlink-install` is
+  *not* compatible with the current setuptools and breaks the
+  package's build (see git history of this DEBUG entry for the
+  failure mode), so every `.py` edit in `src/perception/` or
+  `src/controller/` still needs a rebuild.
+
+---
+
+## 22. Lead distance: pinhole → IPM and semantics → bumper-to-bumper gap [FIXED]
+
+**Symptom / motivation.** ACC distance estimation lived in
+[perception_node.py](src/perception/perception/perception_node.py) as a
+pinhole similar-triangles calculation, `distance = focal_px * H_class
+/ bb_height_px`, with a fixed `OBJECT_HEIGHTS` table giving each YOLO
+class a real-world height (`car: 1.5`, `truck: 3.0`, …). Two problems
+with that:
+
+1. **The reported number was a camera-to-lead distance**, not a
+   bumper-to-bumper gap. The ACC PD law was tuned against the *wrong*
+   semantics — `d0 = 5 m` meant "camera sees 5 m to the lead's
+   centre-ish" which, on a Tesla Model 3 (extent.x = 2.4 m, cam at
+   x = 0.6 m), is only a ~3.2 m physical bumper gap. On a Dodge
+   Charger (extent.x = 2.5 m), ~3.1 m.
+2. **The pinhole estimator was 9-22 % off** across the operating
+   range. We measured this end-to-end with a static CARLA sweep
+   ([carlaaccsim/ipm_validate.py](../../carlaaccsim/ipm_validate.py)):
+
+   | d (bumper gap, m) | IPM err % | Pinhole err % |
+   |---|---|---|
+   | 3  | +2.0 | -19.7 |
+   | 5  | +2.7 | -16.5 |
+   | 7  | +1.3 | -11.8 |
+   | 10 | +1.3 | -11.5 |
+   | 15 | +2.6 | -5.1  |
+
+   Pinhole's residual was structural — the per-class `H` table is a
+   single point estimate of an inherently variable quantity (Model 3
+   ≠ Cadillac ≠ pickup), and YOLO's bb-top edge is loose / clipped /
+   noisy in ways that propagate linearly into the distance. IPM by
+   contrast uses only the bb-bottom edge, projected through the same
+   `cam_height_m = 1.35` / `cam_x_offset = 0.6` / `cam_fov = 90°`
+   triple already in use by the lane-ROI filter and `ipm_view_node`.
+   That triple was validated to sub-1 % over the 7-15 m band in the
+   same sweep, so the IPM-derived distance inherits that accuracy.
+
+### 22a. perception_node — IPM distance + bumper-gap semantics [FIXED]
+
+**Applied changes** in
+[perception_node.py](src/perception/perception/perception_node.py):
+
+- `OBJECT_HEIGHTS` table removed. Pinhole used it for distance;
+  IPM has no analogue (no per-class assumption — see §22 intro).
+- New module-level `VEHICLE_CLASSES = {'car', 'truck', 'bus',
+  'motorcycle'}` keeps the *class filter* that `OBJECT_HEIGHTS` was
+  implicitly providing. Same set of YOLO outputs ignored, no other
+  behaviour change.
+- New ROS parameter `ego_extent_x` (default `2.504`, the CARLA Dodge
+  Charger value). Used to convert the IPM's vehicle-frame `X` (from
+  the ego pivot) into a bumper-to-bumper gap.
+- `estimateLeadDist`: the bottom-centre of each surviving bb is
+  IPM-projected via the existing `_pixel_to_vehicle` — *the same call
+  that was already happening for the lane-ROI filter*. We just read
+  `ground[0]` out of it twice now: once for the lane check, once for
+  the distance:
+  ```python
+  distance_m = max(MIN_PUBLISHED_GAP_M, ground[0] - self.ego_extent_x)
+  ```
+- `MIN_PUBLISHED_GAP_M = 0.1` clamps the published number above zero.
+  At gap ≲ 2 m the bb-bottom clips at the camera frame's lower edge,
+  the IPM under-reads (we saw 0.50 m for a 2 m gt), and a raw
+  subtraction can land at `≤ 0`. The controller treats `d ≤ 0` as
+  "no detection" (resets the low-pass filter and falls through to
+  cruise mode), which would be *unsafe* exactly when a lead is right
+  in front of the bumper. Clamping at 0.1 m keeps the number positive
+  but well below `emergency_distance = 3 m`, so the controller's
+  EMERGENCY brake fires instead of cruise re-engaging.
+- Per-frame `focal_px` computation in `estimateLeadDist` removed —
+  the IPM has its own focal computation inside `_pixel_to_vehicle`.
+
+### 22b. controller_node — semantics + comments updated [FIXED]
+
+The PD math is unchanged; only the *meaning* of the numbers shifted.
+[controller_node.py](src/controller/controller/controller_node.py):
+
+- Docstring updated to call out `/ACC/lead_vehicle_distance` as a
+  bumper-to-bumper gap, pointing back to this section.
+- `d0 = 5.0` and `emergency_distance = 3.0` kept at the same numeric
+  values — they now mean a literal 5 m gap (standstill) and 3 m gap
+  (emergency brake), which is *slightly more conservative* than the
+  pre-IPM behaviour was (5 m camera-to-lead ≈ 3.2 m gap; 3 m
+  camera-to-lead ≈ 1.2 m gap). Decision rationale: keeping the
+  mental model "follow at ~5 m, hit the brakes at 3 m" wins over
+  matching the previous numerical behaviour, especially because the
+  previous behaviour was tuned around a pinhole estimate that was
+  systematically 10-20 % short — so "what felt like 5 m" was really
+  ~4 m. The 5 m gap target after this change is closer to what the
+  operator was probably *intending* all along.
+- Comments around `T_gap`, `d0`, and `emergency_distance` rewritten
+  for the new semantics. The §6 d_desired math is updated in-place:
+  at 20 km/h cruise, `d_desired = 5 + 0.3 * 5.5 ≈ 6.65 m` gap,
+  settling to 5 m at rest.
+
+### 22c. Validation harness — `ipm_validate.py` [DONE]
+
+Standalone CARLA Python script at
+[carlaaccsim/ipm_validate.py](../../carlaaccsim/ipm_validate.py).
+
+- Spawns ego (default Dodge Charger), forces sync mode, attaches the
+  same camera rig as the bridge (1280×720 @ 90° FOV, mounted at
+  `Location(x=0.6, z=1.35)`).
+- For each bumper gap `d ∈ {2, 3, 5, 7, 10, 15}` m, places the lead's
+  rear bumper exactly `d` metres ahead of ego's front bumper:
+  ```python
+  offset = ego_extent_x + d + lead_extent_x   # along ego forward
+  lead.set_transform(Transform(ego_loc + offset * fwd, ego_yaw))
+  ```
+- Captures one frame, runs YOLO via the same `best.pt` perception
+  uses, takes the largest `car` bb, IPM-projects its bottom centre,
+  subtracts `ego_extent_x` to get the bumper-gap.
+- Outputs CSV + annotated PNG per distance.
+
+Two methodological notes for whoever runs it next:
+
+1. **Always query `ego.bounding_box.extent.x` at runtime**, never
+   hard-code it. The Charger's 2.504 m is materially different from
+   the Model 3's 2.396 m, and a hard-coded value would silently bias
+   the gap output by ~10 cm per blueprint swap. The script logs
+   `ego_extent_x` and the derived camera→front-bumper offset on
+   startup so the geometry is visible.
+2. **Don't trust IPM below gap ≈ 3 m.** The script will still
+   report numbers there; they're just dominated by YOLO bb-bottom
+   misbehaviour (frame clip, shadow inclusion, bumper-edge snap),
+   not by IPM precision. See "Why is IPM worse close than far" in
+   the live session — it's a feature interpretation issue, not a
+   model failure.
+
+### Caveats / follow-ups
+
+- **`ego_extent_x` is a static parameter.** If the bridge spawns a
+  different ego blueprint, the user has to remember to override the
+  parameter or the gap drifts by `(extent_x − 2.504)` m. The fix is
+  for the bridge to query `hero.bounding_box.extent.x` once at
+  startup and publish on a latched `/Car_1/ego_extent_x` topic;
+  `perception_node` subscribes and uses whatever it gets. ~10 lines
+  in the bridge + a `create_subscription` here. Not done in this
+  iteration because all current scenarios use the Charger.
+- **Slope sensitivity.** IPM's flat-ground assumption breaks on
+  grades. On a 5 % uphill, a lead at 20 m physical distance reads
+  ~22 m via IPM (1 m of vertical drop interpreted as forward
+  distance). For Town03/Town01 demos this is below 1 % at the
+  speeds we run, but if §20's StreamMapNet work moves us to highway
+  speeds, an IMU-tilt-corrected IPM is the right next step.
+- **Close-range saturation behaviour is now a *feature*.** At gap
+  ≤ 2 m, the IPM gap drops well below the actual gap (we measured
+  0.5 m for a 2 m gt). That value is below `emergency_distance = 3`
+  m so the controller's EMERGENCY branch trips — exactly the right
+  response. No special "saturation-detected" branch is needed in
+  either node, by construction. Documented here so the apparent
+  -75 % error at d=2 in the validation table is not interpreted as
+  a bug.
+- **§6 superseded for the distance estimator.** The §6 ACC distance-
+  filter / d_desired tuning rationale is still correct, but the
+  pinhole-estimator-specific caveats inside §6 (the rant about
+  `OBJECT_HEIGHTS` being a systematic over-estimate at close range)
+  no longer apply — that's all IPM now.
+- **Validation only covered Town03, ClearNoon, single straight
+  spawn.** Cross-town / weather / curved-road validation is open.
+  IPM is camera-geometry only — it should generalise — but the YOLO
+  side is what changes with scene content, and we haven't measured
+  e.g. WetNoon or HardRainNight bb behaviour.
+
+---
+
+## 23. Anchor-based loop route for lead + PP fallback [DONE]
+
+**Background.** Until now the lead vehicle ran TrafficManager's default
+autopilot — `lead_vehicle.set_autopilot(True, tm_port)` plus a speed
+scaler. TM picked its own direction at every junction, so successive
+runs of the same scenario diverged: the ACC test conditions were
+non-reproducible. The ego's pure-pursuit fallback ([§3b](#3b-lkas-off--ego-steers-via-pure-pursuit-fallback-fixed))
+also walked a *different* route (heading-aligned forward walker
+from [build_ego_route](../../carlaaccsim/carlaAccSimTown.py)), so
+during junction PP-takeover the ego could end up on a different road
+than the lead by the time it re-engaged LKAS.
+
+For repeatable ACC tuning we want both vehicles to traverse the *same*
+closed loop, indefinitely.
+
+**Applied changes** in [carlaAccSimTown.py](../../carlaaccsim/carlaAccSimTown.py)
+and [pure_pursuit_controller.py](../../carlaaccsim/pure_pursuit_controller.py):
+
+### 23a. CLI: `--loop-spawns "13,38,92,131,192"` (Town03)
+
+Comma-separated spawn-point indices. When set:
+
+- Ego spawn is *forced* to anchor 0 (overrides `--spawn-index`) so the
+  loop starts where the ego sits — otherwise the ego would spawn
+  off-route and the PP fallback would do something weird at startup.
+- `build_anchor_loop_route(carla_map, anchor_indices)` connects each
+  consecutive pair (cyclic) with `agents.navigation.global_route_planner.
+  GlobalRoutePlanner.trace_route(start, end)`. The result is a list of
+  `carla.Location`s that follow actual driveable roads from anchor `i`
+  to anchor `i+1`, closing the last segment from `anchor[N-1]` back to
+  `anchor[0]`. Duplicate join-point waypoints between segments are
+  trimmed.
+- The same route is used as:
+  1. The lead's TM path via `tm.set_path(lead_vehicle, ego_route)`.
+     TM still owns the actor (collisions, signals, speed scaling) — it
+     just follows our waypoints instead of picking its own turns.
+  2. The ego's `ego_route` consumed by `run_pure_pursuit(...)`. So
+     during junction PP-takeover the ego pursues the same waypoints
+     the lead has been chewing through.
+
+Anchor coordinates for the Town03 default loop (recorded here for
+the operator's reference — printed by `--list-spawns`):
+
+| index | x       | y        | z    | yaw     |
+|------:|--------:|---------:|-----:|--------:|
+| 13    | -74.39  |  42.00   | 0.95 |  -90.16 |
+| 38    |  -9.42  | 113.00   | 0.28 |   89.64 |
+| 92    | 125.36  | -135.59  | 8.31 | -178.77 |
+| 131   |   0.70  | -189.73  | 0.28 |   91.41 |
+| 192   | 207.08  |  -5.19   | 0.28 | -179.14 |
+
+### 23b. Pre-queued laps + monitor-only watcher
+
+**Original design (replaced).** The initial implementation called
+`tm.set_path(lead_vehicle, ego_route)` once at startup, then had a
+background thread that re-called `set_path` each time the lead came
+back near anchor 0 — giving an infinite loop of laps.
+
+**What we observed.** With the default 5-anchor Town03 loop (~1624
+waypoints), the lead drove the *first* lap fine. The lap-watcher's
+*second* `tm.set_path()` call killed the actor within milliseconds:
+the bridge log showed `[lap-watcher] queued another lap` followed
+immediately by `rclpy` callbacks crashing with
+`RuntimeError: trying to operate on a destroyed actor`. CARLA 0.9.16's
+TrafficManager appears to have a bug or limitation around repeated
+`set_path` calls on the same actor.
+
+**Replacement design (current).** Pre-queue *N* laps in a single
+`tm.set_path` call at startup, then make the watcher monitor-only:
+
+- New CLI flag `--loop-laps N` (default 3). The bridge concatenates
+  `N` copies of the route and passes them all to `tm.set_path` once.
+  Each lap's Locations are fresh `carla.Location(x, y, z)` instances
+  rather than shared references, in case TM dedupes by object identity.
+- `_lap_watcher` no longer calls `set_path`. It still polls the lead's
+  position at 1 Hz, latches `has_moved_away` when the lead is > 100 m
+  from anchor 0, and prints `[lap-watcher] lap N complete (d_to_start=...)`
+  on each pass of anchor 0 with a 30 s cooldown to avoid double-counts.
+- Exits cleanly if the lead actor becomes unreachable (collision,
+  server-side despawn, etc.), printing the lap count it observed
+  before exit. No more "destroyed actor" error spam.
+- Cleanup: `lap_stop_event.set()` in the bridge's `finally:` clause
+  alongside the existing `junction_stop.set()`.
+
+**Trade-off accepted.** The test horizon is now bounded: at `--loop-laps 3`
+the lead can drive ~3 laps (≈5 km on the default Town03 anchors) before
+TM's queue empties and it falls back to free-roam. For an actual
+indefinite-lap mode, the bug in `tm.set_path` would need to be either
+fixed upstream or worked around (e.g., destroy & respawn the lead at
+anchor 0 each lap — more invasive, not done).
+
+### 23c. ROS spin-thread robustness against destroyed actors
+
+`custom_ROS_pub_sub.CarlaAVT._publish_distance` previously did
+
+```python
+dist = self.ego_vehicle.get_location().distance(self.lead_vehicle.get_location())
+```
+
+with no `is_alive` guard. When the lead was destroyed mid-run (the
+original `tm.set_path` bug, but also: collisions, server cleanup, or
+user-driven actor.destroy()), the next 50 ms timer fired this
+callback, hit a destroyed actor, raised `RuntimeError`, and crashed
+the entire `rclpy` spin thread — silently stopping all bridge ROS
+publishes including `/Car_1/vehicle/speed`, `/Car_1/camera/front/compressed`,
+and `/ACC/lead_vehicle_distance`. From the operator's view, the bridge
+"just stopped working".
+
+Added a defensive guard: check `is_alive` on both actors before
+calling `get_location`, and wrap the call itself in `try/except RuntimeError`
+for the race between the check and the use. On a missed liveness check,
+`_publish_distance` returns silently — the topic just stops updating
+until the actors come back (they don't, normally — this is just a
+graceful-degradation guard).
+
+### 23d. Pure-pursuit wrap-around (`loop=True`)
+
+`get_target_wp_index` in [pure_pursuit_controller.py](../../carlaaccsim/pure_pursuit_controller.py)
+previously clamped the target index at `len(route) - 1`. For an
+open-ended (non-loop) route that's correct — once you reach the end,
+keep aiming at the last waypoint. For a loop route, it would stall
+the ego right at the join point. Added `loop` kwarg to
+`_run_controller` / `run_pure_pursuit`:
+
+```python
+raw_idx = int(np.argmin(dist)) + 4
+if loop:
+    idx = raw_idx % len(waypoint_list)
+else:
+    idx = min(raw_idx, len(waypoint_list) - 1)
+```
+
+The bridge passes `loop=True` exactly when `--loop-spawns` is set, so
+the legacy ego_route (open-ended forward walker) is unaffected.
+
+### Caveats / follow-ups
+
+- **`anchor[N-1] → anchor[0]` may need to be a *driveable* segment.**
+  `GlobalRoutePlanner.trace_route` raises if the closing segment hits
+  a one-way road in the wrong direction or crosses a tram-only lane.
+  Mitigation: pick anchors that lie on bidirectional driving roads,
+  or add intermediate anchors so the planner has more flexibility.
+- **`anchor_locations` is held as a Python list of `carla.Location`
+  objects in the lap-watcher** — these are server-allocated, and CARLA
+  has been known to invalidate Location handles in long-running
+  scripts after a re-tick. If the watcher ever stops firing, hard-copy
+  to `(x, y, z)` tuples instead.
+- **Lead spawn position is unchanged.** It still spawns
+  `--lead-gap-m` ahead of the ego along the ego's lane forward
+  vector. Since anchor 0 places the ego on the loop, the lead spawns
+  on the path's first segment — natural starting state.
+- **PP `loop=True` plus a route that doesn't actually close** would
+  cause the ego to teleport-aim back to the loop's start when it
+  reaches the end. With `GlobalRoutePlanner.trace_route` closing the
+  last segment by construction, this can't happen — but if a future
+  caller passes `loop=True` with a manually-constructed non-closing
+  route, the ego will visibly snap. Documented here in case.
+- **Sync-mode interaction (§4).** The lap-watcher runs in real time
+  (`time.sleep(1.0)`) regardless of the simulation tick rate. In
+  async mode (current default), that's fine. In sync mode, the
+  watcher still fires at wall-clock 1 Hz, which is fine because it
+  only does a distance check — not a tick-side action.
+- **Switching ego or lead blueprint while loop mode is active.**
+  Should be transparent — the loop is built from map geometry, not
+  vehicle bbox. Verified for Charger; should hold for any
+  driving-class blueprint.
+

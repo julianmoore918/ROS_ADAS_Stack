@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
+import os
+os.environ.setdefault('OMP_NUM_THREADS',      '2')
+os.environ.setdefault('MKL_NUM_THREADS',      '2')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '2')
+os.environ.setdefault('NUMEXPR_NUM_THREADS',  '2')
+
 import math
+import cv2
+cv2.setNumThreads(2)
+import numpy as np
+import torch
+torch.set_num_threads(2)
+torch.set_num_interop_threads(2)
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32
 from nav_msgs.msg import Path
-import cv2
-import numpy as np
+from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import CompressedImage
 from ultralytics import YOLO
 from ament_index_python.packages import get_package_share_directory
-import os
-from sensor_msgs.msg import CompressedImage
+
 
 
 # ========================
@@ -24,9 +36,36 @@ USE_ROI             = False   # ← flip to True to enable static-polygon ROI ma
 # is empty (UFLD warm-up or the bridge has paused inference inside a
 # junction zone).
 USE_LANE_ROI        = True
-MIN_CONFIDENCE      = 0.1     # detections below this are ignored
+MIN_CONFIDENCE      = 0.8     # detections below this are ignored.
+# Was 0.1 — far too permissive: weak YOLO boxes on buildings / poles /
+# foliage at ~0.3-0.5 confidence were slipping through the lane-ROI
+# filter (when the UFLD polylines either didn't reach the false bb's
+# projected X or the bb-bottom IPM-projected to a Y that happened to
+# land inside the polylines despite being well off to the image side).
+# That made EMERGENCY brake fire on phantom objects.
+# 0.6 sits well below every real-lead confidence the
+# carlaaccsim/ipm_validate.py sweep observed at d ∈ {3, 5, 7, 10, 15} m
+# (0.90-0.95) and well above the false-positive band we were seeing.
+# See DEBUG §22 follow-up.
 PUBLISH_INF         = True    # publish inf when no vehicle detected. Set False to publish nothing on no-detection
-ENABLE_LOGGING      = False  # set True to enable terminal output
+ENABLE_LOGGING      = True  # set True to enable terminal output
+
+# YOLO class names that count as a lead vehicle for ACC purposes.
+# Pinhole's OBJECT_HEIGHTS table is gone — IPM gets distance from
+# camera-mount geometry, not from per-class real-world height — so we
+# only need a *set* of vehicle classes to filter on. See DEBUG §22.
+VEHICLE_CLASSES     = {'car', 'truck', 'bus', 'motorcycle'}
+# Lower-bound clamp on the published distance. IPM saturates at small
+# gaps (bb-bottom clips at frame edge → distance can come out near 0
+# or negative). We clamp at 0.1 m so the value is still positive (the
+# controller resets state when d ≤ 0), but well below
+# `emergency_distance` so the controller's EMERGENCY brake fires.
+MIN_PUBLISHED_GAP_M = 0.1
+LANE_HALF_M       = 1.75   # half a CARLA Town lane (~3.5 m wide)
+EXTRAP_MAX_M      = 10.0   # how far past a polyline tip we trust extrapolation
+                            # (was 5 — too tight; rejected real far-range leads
+                            # whose X exceeded UFLD's short polyline tips,
+                            # forcing the centre-strip fallback to catch them)
 
 
 class YoloDetection(Node):
@@ -37,12 +76,17 @@ class YoloDetection(Node):
         self.get_logger().info(f"    Min conf:   {MIN_CONFIDENCE}")
         self.get_logger().info(f"    Publish inf: {PUBLISH_INF}")
 
-        # Subscribers
+        # Subscribers — single-threaded executor (see main()). The
+        # MultiThreadedExecutor + callback-group split was an attempt
+        # to decouple the centerline timer from the slow YOLO callback,
+        # but it caused YOLO itself to stop firing in some runs
+        # (camera sub appeared to go silent under multi-threading).
+        # Reverted to the original setup that ACC was working under.
         self.create_subscription(
             CompressedImage,
             '/Car_1/camera/front/compressed',
             self.listener_callback,
-            10
+            10,
         )
         # UFLD lanes in the vehicle frame (REP 103: X forward, Y left).
         # Used by the lane-ROI filter — see _in_ego_lane. Each list holds
@@ -61,6 +105,22 @@ class YoloDetection(Node):
         # Publishers
         self.dist_pub  = self.create_publisher(Float32,          '/ACC/lead_vehicle_distance',   10)
         self.debug_pub = self.create_publisher(CompressedImage,  '/ACC/perception/debug_image',  10)
+        # Closest in-lane lead's bb-bottom edge, IPM-projected to vehicle
+        # frame as (left_corner, right_corner). Two-pose Path so
+        # ipm_view_node can draw the ground line corresponding to the
+        # distance it just published on /ACC/lead_vehicle_distance.
+        # Empty path when no in-lane lead.
+        self.bb_ground_pub = self.create_publisher(Path,         '/ACC/lead_bb_ground',          10)
+        # Interpolated centerline — exactly what `_centerline_at` returns,
+        # sampled at 1 m intervals out to the longer polyline's tip plus
+        # EXTRAP_MAX_M. Single source of truth so the BEV overlay matches
+        # the corridor the in-lane gate is actually using to filter
+        # detections. Consumed by ipm_view_node.
+        self.centerline_pub = self.create_publisher(Path,        '/LKAS/centerline_debug',       10)
+
+        # Centerline is published from inside estimateLeadDist (per
+        # YOLO frame). The independent 10 Hz timer attempt required
+        # MultiThreadedExecutor which destabilised YOLO — reverted.
 
         # Load YOLO model
         pkg_share = get_package_share_directory('perception')
@@ -89,12 +149,16 @@ class YoloDetection(Node):
         self.cam_h_m   = self.get_parameter('cam_height_m').value
         self.cam_x_off = self.get_parameter('cam_x_offset').value
 
-        self.OBJECT_HEIGHTS = {
-            "car":        1.5,
-            "truck":      3.0,
-            "bus":        3.2,
-            "motorcycle": 1.2,
-        }
+        # Ego half-length along forward axis (vehicle origin → front
+        # bumper). Used to convert the IPM's vehicle-frame X (which is
+        # measured from the pivot) into a bumper-to-bumper gap. Default
+        # 2.504 m is the CARLA Dodge Charger value; switch to whatever
+        # ego blueprint the bridge spawns. A future improvement is for
+        # the bridge to publish ego.bounding_box.extent.x on a latched
+        # topic so this stays correct across blueprint changes without
+        # touching parameters here. See DEBUG §22.
+        self.declare_parameter('ego_extent_x', 2.504)
+        self.ego_extent_x = self.get_parameter('ego_extent_x').value
 
     # ========================
     # LANE ROI from UFLD (vehicle-frame IPM)
@@ -146,21 +210,98 @@ class YoloDetection(Node):
                 t = (x_target - x0) / (x1 - x0)
                 return y0 + t * (y1 - y0)
         return None
+    
+    
+
+    def _centerline_at(self, x_fwd: float) -> float | None:
+        """Lane centerline Y_left at the given X_forward. Four cases:
+          - both polylines reach X → midpoint
+          - only left  reaches X → left_y  - LANE_HALF_M  (centerline
+                                              is one half-lane to the right)
+          - only right reaches X → right_y + LANE_HALF_M
+          - neither reaches X    → bounded forward extrapolation of
+                                              whichever polyline got furthest
+        Returns None only when there is no usable signal at this X.
+        REP 103 axes: Y positive = left of ego."""
+        left_y  = self._interp_y_at_x(self.left_veh,  x_fwd)
+        right_y = self._interp_y_at_x(self.right_veh, x_fwd)
+        if left_y is not None and right_y is not None:
+            return 0.5 * (left_y + right_y)
+        if left_y is not None:
+            return left_y - LANE_HALF_M
+        if right_y is not None:
+            return right_y + LANE_HALF_M
+        return self._extrapolate_centerline(x_fwd)
+
+    def _extrapolate_centerline(self, x_fwd: float) -> float | None:
+        """Project the polyline that reaches furthest forward using its
+        last-segment slope, up to EXTRAP_MAX_M past its tip. Bounded so
+        a junction-induced UFLD drop-out can't let the gate hallucinate
+        a lane out to infinity."""
+        candidates = []   # (x_tip, polyline, centerline_offset)
+        for polyline, offset in ((self.left_veh,  -LANE_HALF_M),
+                                 (self.right_veh, +LANE_HALF_M)):
+            if len(polyline) >= 2:
+                candidates.append((polyline[-1][0], polyline, offset))
+        if not candidates:
+            return None
+        # Use the polyline whose tip reaches furthest forward → smallest
+        # extrapolation distance for this X.
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        x_tip, polyline, offset = candidates[0]
+        if x_fwd <= x_tip or (x_fwd - x_tip) > EXTRAP_MAX_M:
+            return None
+        x_prev, y_prev = polyline[-2]
+        y_tip          = polyline[-1][1]
+        dx = x_tip - x_prev
+        slope = (y_tip - y_prev) / dx if abs(dx) > 1e-3 else 0.0
+        return (y_tip + slope * (x_fwd - x_tip)) + offset
 
     def _in_ego_lane(self, x_fwd: float, y_left: float) -> bool | None:
-        """True iff (x_fwd, y_left) lies between the left and right
-        UFLD lanes at this X. None means "can't tell" — either lane is
-        empty, or X falls outside both polylines' overlap. Caller
-        should fall back to the legacy centre-strip filter in that case."""
+        """ORIGINAL behaviour, restored. True iff the ground point lies
+        between the left and right UFLD polylines at this X. Returns
+        None only when either polyline can't be interpolated at this X
+        (UFLD warm-up, junction pause, or X beyond polyline range) —
+        caller falls back to the legacy image-space centre-strip filter.
+
+        The previous "centerline ± LANE_HALF_M" variant + single-polyline
+        synthesis was over-rejecting real in-lane leads when one UFLD
+        polyline went wonky, causing ACC to silently accept no leads
+        and bump into the car in front. _centerline_at is still used by
+        _publish_centerline_debug for the BEV overlay — it's just not
+        the filter any more."""
         left_y  = self._interp_y_at_x(self.left_veh,  x_fwd)
         right_y = self._interp_y_at_x(self.right_veh, x_fwd)
         if left_y is None or right_y is None:
             return None
-        # REP 103: Y positive = left. Left lane → larger Y, right lane →
-        # smaller (possibly negative) Y. Inside the lane means Y is
-        # bounded by the two.
         lo, hi = sorted((left_y, right_y))
         return lo <= y_left <= hi
+
+    def _publish_centerline_debug(self, header):
+        """Sample _centerline_at at 1 m intervals out to the longer
+        polyline's tip + EXTRAP_MAX_M and publish the result as a Path.
+        Reuses the exact gate logic — what shows up on the BEV is what
+        the in-lane filter is using to accept/reject detections. Empty
+        path means the gate has no usable centerline (UFLD silent /
+        both polylines too short to extrapolate)."""
+        path = Path()
+        path.header = header
+        path.header.frame_id = 'base_link'
+        max_x = 0.0
+        for polyline in (self.left_veh, self.right_veh):
+            if len(polyline) >= 2:
+                max_x = max(max_x, polyline[-1][0] + EXTRAP_MAX_M)
+        x = 1.0
+        while x <= max_x:
+            y = self._centerline_at(x)
+            if y is not None:
+                pose = PoseStamped()
+                pose.header = path.header
+                pose.pose.position.x = float(x)
+                pose.pose.position.y = float(y)
+                path.poses.append(pose)
+            x += 1.0
+        self.centerline_pub.publish(path)
 
     # ========================
     # STATIC ROI MASK (optional, legacy)
@@ -203,57 +344,71 @@ class YoloDetection(Node):
     # ========================
     def estimateLeadDist(self, img, boxes, confs, classes, header):
         min_distance = None
+        best_conf    = None        # YOLO conf of the currently-selected lead
+        closest_bb_ground = None   # ((X_left,Y_left), (X_right,Y_right)) for BEV
 
         h, w, _ = img.shape
         img_center_x = w / 2
-        # Focal length in pixels = image_width / (2 * tan(FOV/2)). Computed
-        # per frame so the formula adapts to whatever camera resolution
-        # the bridge is publishing (was hard-coded at 640 for 1280-wide).
-        focal_px = w / (2.0 * math.tan(self.CAM_FOV_RAD / 2.0))
 
         for box, conf, cls in zip(boxes, confs, classes):
             x_min, y_min, x_max, y_max = box.astype(int)
             class_name = self.model.names[int(cls)]
 
-            if class_name not in self.OBJECT_HEIGHTS:
+            if class_name not in VEHICLE_CLASSES:
                 continue
 
             if conf < MIN_CONFIDENCE:
                 continue
 
-            # Where the rear of the vehicle meets the road — the
-            # natural anchor for "is this vehicle in my lane". IPM
-            # turns that ground pixel into (X_forward, Y_left) in the
-            # same vehicle frame UFLD uses, so we just check whether Y
-            # is between the left and right lanes at that X.
+            # IPM-project the bottom-centre of the bb to a ground point
+            # in vehicle frame (REP 103: X forward, Y left). This single
+            # pixel anchors both the lane-ROI filter *and* the published
+            # distance — same projection, no second model. See DEBUG §22.
             box_center_x = (x_min + x_max) / 2
             box_bottom_y = y_max
+            ground = self._pixel_to_vehicle(box_center_x, box_bottom_y, w, h)
+            if ground is None:
+                # bb-bottom at or above horizon — can't ground-project.
+                continue
+
             if USE_LANE_ROI:
-                ground = self._pixel_to_vehicle(
-                    box_center_x, box_bottom_y, w, h)
-                in_lane = (self._in_ego_lane(*ground)
-                           if ground is not None else None)
+                in_lane = self._in_ego_lane(*ground)
                 if in_lane is False:
                     continue
-                if in_lane is None and \
-                        abs(box_center_x - img_center_x) > w * 0.2:
-                    # UFLD hasn't published a usable lane at this X
-                    # (warm-up, junction pause, or detection beyond the
-                    # lane polyline's range) — fall back to the legacy
-                    # centre-strip filter so ACC isn't blind.
-                    continue
+                if in_lane is None:
+                    # _centerline_at has no signal at this X — both
+                    # polylines too short to interp *and* both too short
+                    # to extrapolate. Rather than going blind (the
+                    # last revision dropped here and ACC bumped into
+                    # real leads when UFLD was silent), fall back to
+                    # the legacy image-space centre-strip as a safety
+                    # net. Wide enough to admit reasonable in-lane
+                    # candidates, narrow enough to still reject the
+                    # shoulder-taxi case that motivated the gate.
+                    if abs(box_center_x - img_center_x) > w * 0.2:
+                        continue
             elif abs(box_center_x - img_center_x) > w * 0.2:
                 continue
 
-            box_height = y_max - y_min
-            if box_height <= 0:
-                continue
-
-            real_height  = self.OBJECT_HEIGHTS[class_name]
-            distance_m   = (focal_px * real_height) / box_height
+            # Bumper-to-bumper gap = lead's bb-bottom ground X − ego
+            # front bumper X (= ego_extent_x in vehicle frame). Clamped
+            # at MIN_PUBLISHED_GAP_M so close-range IPM saturation
+            # (gap ≤ 2 m → bb clips at frame edge → IPM under-reads)
+            # still trips the controller's EMERGENCY brake instead of
+            # being filtered out as d ≤ 0.
+            distance_m = max(MIN_PUBLISHED_GAP_M,
+                             ground[0] - self.ego_extent_x)
 
             if min_distance is None or distance_m < min_distance:
                 min_distance = distance_m
+                best_conf    = float(conf)   # track conf of selected lead
+                # Project both bb-bottom corners for BEV visualisation.
+                # Same v (y_max) for both → same X_forward; only Y differs,
+                # so the BEV line will be horizontal at the lead's range.
+                left_g  = self._pixel_to_vehicle(x_min, y_max, w, h)
+                right_g = self._pixel_to_vehicle(x_max, y_max, w, h)
+                closest_bb_ground = (left_g, right_g) \
+                    if (left_g is not None and right_g is not None) else None
 
             # Draw bounding box on debug image
             label = f"{class_name} {conf:.2f}  {distance_m:.1f}m"
@@ -267,11 +422,34 @@ class YoloDetection(Node):
             msg.data = float(min_distance)
             self.dist_pub.publish(msg)
             if ENABLE_LOGGING:
-                self._log_throttled(f"Closest vehicle: {min_distance:.2f} m  |  conf: {best_conf:.2f}")
+                conf_text = (f"{best_conf:.2f}"
+                             if best_conf is not None else "n/a")
+                self._log_throttled(
+                    f"Closest vehicle: {min_distance:.2f} m  |  conf: {conf_text}")
         elif PUBLISH_INF:
             msg = Float32()
             msg.data = float('inf')
             self.dist_pub.publish(msg)
+
+        # ── BB-bottom ground line publish (for ipm_view_node BEV) ──
+        bb_path = Path()
+        bb_path.header = header
+        bb_path.header.frame_id = 'base_link'
+        if closest_bb_ground is not None:
+            for (x_fwd, y_left) in closest_bb_ground:
+                pose = PoseStamped()
+                pose.header = bb_path.header
+                pose.pose.position.x = float(x_fwd)
+                pose.pose.position.y = float(y_left)
+                bb_path.poses.append(pose)
+        self.bb_ground_pub.publish(bb_path)
+
+        # ── Centerline debug → ipm_view_node BEV ──────────────
+        # Same _centerline_at the gate uses, sampled at 1 m intervals.
+        # Publishes at YOLO rate (per camera frame). When YOLO is slow
+        # the BEV centerline updates slower too — accepted tradeoff
+        # since the MultiThreadedExecutor alternative destabilised YOLO.
+        self._publish_centerline_debug(header)
 
         # ── Debug image → Foxglove ────────────────────────────
         _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -296,7 +474,11 @@ class YoloDetection(Node):
 # ========================
 def main(args=None):
     rclpy.init(args=args)
-    node = YoloDetection()  # or YoloDetection()
+    node = YoloDetection()
+    # Single-threaded executor — original setup that YOLO was working
+    # under. The MultiThreadedExecutor variant decoupled the centerline
+    # timer from YOLO but caused the camera subscription to stop
+    # delivering messages in some runs, leaving ACC blind. Reverted.
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):

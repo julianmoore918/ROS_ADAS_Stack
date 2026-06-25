@@ -49,8 +49,13 @@ ros2 run perception debug_image_fusion_node &
 FUSION_PID=$!
 echo "[INFO] Debug-image fusion node started (PID $FUSION_PID)"
 
+# ── Launch IPM bird's-eye view ──────────────────────────
+ros2 run perception ipm_view_node &
+IPM_VIEW_PID=$!
+echo "[INFO] IPM view node started (PID $IPM_VIEW_PID)"
+
 # ── Shutdown handler ────────────────────────────────────
-PIDS="$PERCEPTION_PID $CONTROLLER_PID $LANE_DETECTION_PID $STANLEY_PID $FUSION_PID"
+PIDS="$PERCEPTION_PID $CONTROLLER_PID $LANE_DETECTION_PID $STANLEY_PID $FUSION_PID $IPM_VIEW_PID"
 trap "echo; echo '[INFO] Shutting down ADAS stack…'; kill $PIDS 2>/dev/null; exit 0" SIGINT SIGTERM
 
 wait

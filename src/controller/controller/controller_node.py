@@ -17,7 +17,14 @@ Control law:
 
 Subscribed topics:
     /Car_1/vehicle/speed              (Float64)  – ego velocity [m/s]
-    /ACC/lead_vehicle_distance        (Float32)  – distance to lead [m]
+    /ACC/lead_vehicle_distance        (Float32)  – bumper-to-bumper gap to
+                                                    lead [m]. perception_node
+                                                    now publishes this as the
+                                                    IPM-projected lead rear-bumper
+                                                    X minus ego.extent.x (see
+                                                    DEBUG §22). All ACC constants
+                                                    below are therefore in *gap*
+                                                    units, not camera-to-lead.
 
 Published topics:
     /Car_1/cmd_vel                    (Twist)    – linear.x = throttle,
@@ -38,6 +45,14 @@ from geometry_msgs.msg import Twist
 # CONFIG FLAGS
 # ========================
 ENABLE_LOGGING = False  # set True to enable terminal output
+
+# Single source of truth for the cruise / shared longitudinal target.
+# ACC's cruise mode targets this. Stanley is lateral-only (no speed
+# concept) and the bridge's pure-pursuit junction fallback reads
+# throttle/brake from this controller via `throttle_brake_provider`
+# (see carlaaccsim/pure_pursuit_controller.py:_make_ego_speed_policy)
+# — so PP during junctions also tracks this same target indirectly.
+CRUISE_SPEED_KMH = 20.0
 
 
 class ACCNode(Node):
@@ -62,19 +77,31 @@ class ACCNode(Node):
         self.control_pub = self.create_publisher(Twist, '/Car_1/cmd_vel', 20)
 
         # ── ACC parameters ───────────────────────────────────────────────
-        self.target_speed      = 20 / 3.6  # [m/s]
-        self.d0                = 5.0       # standstill gap [m]
-        # d_desired = d0 + T_gap * v_ego. With T_gap=1.5 s the formula gave
-        # 13.4 m at 20 km/h cruise, so ACC began braking the moment YOLO saw
-        # a lead inside ~13 m — felt over-cautious for the demo. T_gap=0.5 s
-        # gives ~7.8 m at cruise (settling to d0=5 m at standstill), which
-        # matches the "follow at roughly 5 m" mental model.
+        # NOTE: all distances below are *bumper-to-bumper gaps*, not
+        # camera-to-lead. perception_node was previously publishing
+        # pinhole camera→object distance; it now publishes
+        # ipm_origin − ego_extent_x. d0=5 here therefore means a literal
+        # 5 m gap at standstill (slightly more conservative than the
+        # pre-IPM behaviour, which was ~3.25 m gap on a Model 3). See
+        # DEBUG §22 for the semantics change.
+        self.target_speed      = CRUISE_SPEED_KMH / 3.6  # [m/s]
+        self.d0                = 3.0       # standstill bumper gap [m]
+        # d_desired = d0 + T_gap * v_ego. T_gap=0.3 s → at 20 km/h cruise
+        # (5.5 m/s), d_desired ≈ 6.65 m, settling to d0=5 m at rest.
+        # That matches the "follow at roughly 5 m gap" mental model and
+        # gives the controller enough headroom that closing-rate dominates
+        # the PD response on a lead deceleration event.
         self.T_gap             = 0.3
         self.k_p               = 1.2       # proportional gain
         self.k_d               = 0.8       # derivative gain
         self.a_max             = 3.0       # [m/s²]
         self.a_min             = -6.0      # [m/s²]
-        self.emergency_distance = 3.0      # full brake below this distance [m]
+        # Emergency threshold is now a bumper gap, not a camera distance.
+        # IPM also saturates near gap ≤ 2 m (bb-bottom clips at frame
+        # edge → reported gap drops well below truth) — the saturated
+        # value still falls under this 3 m threshold, so saturation
+        # itself trips EMERGENCY without any special branch. See §22.
+        self.emergency_distance = 1.0      # full brake below this gap [m]
         self.throttle_scale    = 3.0       # a_max → full throttle
         self.brake_scale       = 3.0       # a_min → full brake
         self.prev_throttle     = 0.0
@@ -207,28 +234,30 @@ class ACCNode(Node):
 
     def cruise_control(self) -> tuple:
         """
-        Simple proportional speed controller for cruising.
+        Symmetric proportional speed controller for cruising. Settles at
+        CRUISE_SPEED_KMH instead of blowing past it.
 
-        Returns (throttle, brake) tuple.
-        When no lead vehicle is visible the ego vehicle gently
-        accelerates/maintains toward the target speed.
+        Previous law was asymmetric — throttle gain 0.3 (cap 1.0) but
+        brake gain 0.1 (cap 0.3) — which let the car overshoot the
+        20 km/h target by ~10 m/s under CARLA's inertia before the weak
+        brake could bring it back. Symmetric gains + a small 0.5 m/s
+        deadband around target avoids hunting and keeps cruise honest.
+
+        Returns (throttle, brake).
         """
-        speed_error = self.target_speed - self.v_ego
+        speed_error = self.target_speed - self.v_ego  # +ve = need to speed up
 
-        if speed_error > 0:
-            # Proportional gain: 0.3 per 1 m/s error, capped at full throttle.
-            # At 10 m/s error → throttle = 1.0 (full power to reach target)
-            # At  2 m/s error → throttle = 0.6 (gentle approach)
+        if speed_error > 0.5:
             throttle = min(speed_error * 0.3, 1.0)
-            brake = 0.0
-        elif speed_error < -1.0:
-            # More than 1 m/s over target → light braking.
+            brake    = 0.0
+        elif speed_error < -0.5:
+            # Same 0.3 gain shape on the brake side, capped a touch
+            # higher (0.6) so we can actually arrest a large overshoot.
             throttle = 0.0
-            brake = min(-speed_error * 0.1, 0.3)
+            brake    = min(-speed_error * 0.3, 0.6)
         else:
-            # Within tolerance → coast.
             throttle = 0.0
-            brake = 0.0
+            brake    = 0.0
 
         return throttle, brake
 
@@ -293,11 +322,24 @@ class ACCNode(Node):
         a = self.acc_control(self.v_ego, self.d_lead)
 
         if a >= 0:
-            throttle = min(a / self.throttle_scale, 1.0)
-            brake = 0.0
+            acc_throttle = min(a / self.throttle_scale, 1.0)
+            acc_brake    = 0.0
         else:
-            throttle = 0.0
-            brake = min(-a / self.brake_scale, 1.0)
+            acc_throttle = 0.0
+            acc_brake    = min(-a / self.brake_scale, 1.0)
+
+        # ACC must respect CRUISE_SPEED_KMH as an upper cap. The PD law
+        # above has no concept of "we're already at set speed" — with a
+        # lead 30 m ahead, distance_error stays large and saturates
+        # a → a_max → throttle = 1.0 *indefinitely*, even past 100 km/h.
+        # Real ACC behaves as "follow the lead OR hold set speed,
+        # whichever is slower" — implemented here as the lower throttle
+        # and the higher brake of the two controllers. The cruise side
+        # commands brake whenever v_ego > target + 0.5, which arrests
+        # the runaway.
+        cruise_throttle, cruise_brake = self.cruise_control()
+        throttle = min(acc_throttle, cruise_throttle)
+        brake    = max(acc_brake,    cruise_brake)
 
         # Rate limit throttle — braking is always instant
         throttle = min(throttle, self.prev_throttle + self.THROTTLE_RATE_LIMIT)

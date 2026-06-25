@@ -32,10 +32,16 @@ Published topics:
 
 import math
 import os
+os.environ.setdefault('OMP_NUM_THREADS',      '2')
+os.environ.setdefault('MKL_NUM_THREADS',      '2')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '2')
+os.environ.setdefault('NUMEXPR_NUM_THREADS',  '2')
+
 import sys
 import importlib
 
 import cv2
+cv2.setNumThreads(2)
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -45,6 +51,11 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool
+
+import torch
+torch.set_num_threads(2)
+torch.set_num_interop_threads(2)
+
 
 
 # Camera intrinsics / extrinsics — defaults match the validate-script CARLA rig.
@@ -82,7 +93,7 @@ class UFLDInference:
         net = importlib.import_module(
             'model.model_' + self.cfg.dataset.lower()
         ).get_model(self.cfg)
-        state = torch.load(model_path, map_location='cpu')['model']
+        state = torch.load(model_path, map_location=device)['model']
         compatible = {k[7:] if k.startswith('module.') else k: v
                       for k, v in state.items()}
         net.load_state_dict(compatible, strict=False)
@@ -161,6 +172,10 @@ class LaneDetectionNode(Node):
         self.declare_parameter('cam_height_m', DEFAULT_CAM_HEIGHT_M)
         self.declare_parameter('cam_x_offset', DEFAULT_CAM_X_OFFSET)
 
+        # Run UFLD on every Nth camera frame. Camera publishes at ~20 Hz;
+        # N=4 gives ~5 Hz inference, which is plenty at the 20 km/h target.
+        self.declare_parameter('inference_skip_n', 4)
+
         ufld_repo   = self.get_parameter('ufld_repo').value
         cfg_rel     = self.get_parameter('ufld_config_rel').value
         model_name  = self.get_parameter('model_filename').value
@@ -170,6 +185,7 @@ class LaneDetectionNode(Node):
         self.cam_fov    = math.radians(self.get_parameter('cam_fov_deg').value)
         self.cam_h_m    = self.get_parameter('cam_height_m').value
         self.cam_x_off  = self.get_parameter('cam_x_offset').value
+        self.skip_n     = max(1, int(self.get_parameter('inference_skip_n').value))
 
         # ── Resolve weights from the package share dir ───────────────────
         pkg_share = get_package_share_directory('perception')
@@ -275,16 +291,18 @@ class LaneDetectionNode(Node):
             )
 
     def camera_callback(self, msg: CompressedImage):
+        self.frame_count += 1
+        if (self.frame_count - 1) % self.skip_n != 0:
+            return
         arr = np.frombuffer(msg.data, np.uint8)
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if bgr is None:
             return
-        if self.frame_count == 0:
+        if self.frame_count == 1:
             self.get_logger().info(
                 f'First camera frame received ({bgr.shape[1]}x{bgr.shape[0]}) — '
-                f'inference active'
+                f'inference active (running every {self.skip_n} frames)'
             )
-        self.frame_count += 1
         img_h, img_w = bgr.shape[:2]
 
         # In a junction zone, emit empty Paths and the raw camera frame
