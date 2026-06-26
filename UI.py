@@ -145,7 +145,7 @@ print(f'[weather] applied {preset}')
 """
 
 _TRAFFIC_SPAWN_SNIPPET = """
-import carla, random, sys
+import carla, random, sys, time
 n = int(sys.argv[1])
 port = int(sys.argv[2])
 client = carla.Client('localhost', port); client.set_timeout(10.0)
@@ -154,23 +154,100 @@ bp_lib = world.get_blueprint_library()
 spawn_points = world.get_map().get_spawn_points()
 random.shuffle(spawn_points)
 vehicle_bps = [bp for bp in bp_lib.filter('vehicle.*')
-               if int(bp.get_attribute('number_of_wheels')) == 4]
-tm = client.get_trafficmanager(port + 6000)
+               if bp.has_attribute('number_of_wheels')
+               and int(bp.get_attribute('number_of_wheels')) == 4]
+
+# Use the bridge's default TM port (8000). The previous `port + 6000`
+# math landed on 8000 only when CARLA was on port 2000 and silently
+# created a *second* TM at 8002 / 8003 / etc. on any other CARLA port.
+# Always-default keeps UI and bridge on the same shared TM.
+tm = client.get_trafficmanager()
 tm.set_global_distance_to_leading_vehicle(2.5)
+tm.global_percentage_speed_difference(30.0)
+# Critical: explicitly force TM async to match world. TM state persists
+# across processes on the CARLA server, so a prior session that left
+# this TM in sync mode would freeze every NPC we spawn here.
 tm.set_synchronous_mode(False)
-spawned = 0
-for sp in spawn_points:
-    if spawned >= n:
-        break
+# Hybrid physics mode ALSO persists server-side across sessions. With
+# it on, NPCs far from any hero are dormant (no physics, no motion) —
+# looks identical to "autopilot disengaged". Force it off so every
+# spawned NPC gets full physics regardless of distance to the ego.
+tm.set_hybrid_physics_mode(False)
+# Belt-and-braces: if any NPC ends up dormant despite the line above
+# (CARLA can mark distant actors dormant under memory pressure), TM
+# will revive it instead of leaving it stuck.
+try:
+    tm.set_respawn_dormant_vehicles(True)
+except Exception:
+    pass  # older CARLA builds may not have this method
+
+# Atomic spawn + autopilot via batch commands. Without the .then()
+# chaining, there was a window between try_spawn_actor returning and
+# set_autopilot landing in which the vehicle existed but had no
+# controller — it drifted on default zero-throttle / centred-steer
+# and crashed into curbs / other actors. Exactly the bug we fixed
+# in carlaaccsim/carlaAccSimTown.py:spawn_traffic; same fix needed
+# here because UI.py spawns NPCs independently of the bridge.
+SpawnActor   = carla.command.SpawnActor
+SetAutopilot = carla.command.SetAutopilot
+FutureActor  = carla.command.FutureActor
+
+batch = []
+for sp in spawn_points[:n]:
     bp = random.choice(vehicle_bps)
+    if bp.has_attribute('color'):
+        colors = bp.get_attribute('color').recommended_values
+        if colors:
+            bp.set_attribute('color', random.choice(colors))
     if bp.has_attribute('role_name'):
-        bp.set_attribute('role_name', 'npc')
-    actor = world.try_spawn_actor(bp, sp)
-    if actor is None:
-        continue
-    actor.set_autopilot(True, tm.get_port())
-    spawned += 1
-print(f'[traffic] spawned {spawned}/{n} NPCs')
+        bp.set_attribute('role_name', 'npc')   # cleared by clear-snippet
+    batch.append(
+        SpawnActor(bp, sp)
+        .then(SetAutopilot(FutureActor, True, tm.get_port()))
+    )
+
+# due_tick_cue=True so the server processes the SpawnActor + the
+# chained SetAutopilot together within this call and we know the
+# autopilot attachment has *landed* before the subprocess exits.
+# With False the batch was queued and returned immediately — by the
+# time the next async tick processed it, the snippet had already
+# exited and its TM client connection had died, leaving freshly-
+# spawned NPCs orphaned (registered with TM but never controlled).
+# Matches the bridge's spawn_traffic which uses True and works.
+spawned_ids = []
+for resp in client.apply_batch_sync(batch, True):
+    if not resp.error:
+        spawned_ids.append(resp.actor_id)
+print(f'[traffic] spawned {len(spawned_ids)}/{n} NPCs (atomic batch, async TM)',
+      flush=True)
+
+# Long-lived heartbeat loop. The previous 2 s sleep wasn't enough —
+# NPCs were registered with TM via the batch's SetAutopilot, but the
+# moment this subprocess exited and its TM client connection died,
+# the NPCs either lost autopilot or were dropped by TM (CARLA 0.9.16
+# tracks the registering client per-vehicle, and orphaned vehicles
+# freeze even if other clients — like the bridge — are still
+# connected to the same TM). Keeping the client alive forever fixes
+# that, and re-asserting set_autopilot every few seconds also
+# rescues any vehicle TM might have forgotten for any reason.
+# The clear-snippet still finds these NPCs by role_name='npc' and
+# destroys them; killing this subprocess (UI shutdown / restart)
+# then releases TM ownership cleanly.
+import signal
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+print('[traffic] heartbeat loop started — keep this process alive to '
+      'maintain NPC autopilot. Will re-assert every 5 s.', flush=True)
+while True:
+    time.sleep(5.0)
+    npcs = [a for a in world.get_actors().filter('vehicle.*')
+            if a.attributes.get('role_name') == 'npc']
+    for a in npcs:
+        try:
+            a.set_autopilot(True, tm.get_port())
+        except Exception:
+            pass
+    print(f'[traffic] heartbeat: {len(npcs)} NPCs in autopilot',
+          flush=True)
 """
 
 _TRAFFIC_CLEAR_SNIPPET = """
@@ -272,6 +349,15 @@ class ADASUI:
         self.foxglove_proc: subprocess.Popen | None = None      # foxglove_bridge
         self.acc_procs: list[subprocess.Popen] = []             # when toggled independently
         self.lkas_procs: list[subprocess.Popen] = []
+        # NPC spawner runs the long-lived TRAFFIC_SPAWN_SNIPPET. The
+        # snippet stays alive in a heartbeat loop to keep its TM client
+        # connected — without that, CARLA 0.9.16 drops per-vehicle
+        # autopilot ownership and the NPCs freeze. Tracked so Spawn
+        # can replace the previous spawner, Clear can kill it before
+        # destroying the actors (otherwise the heartbeat would just
+        # re-attach autopilot on cars Clear is about to destroy), and
+        # UI shutdown can clean it up so it doesn't survive past the UI.
+        self.npc_spawn_proc: subprocess.Popen | None = None
 
         self.acc_on = False
         self.lkas_on = False
@@ -824,9 +910,12 @@ class ADASUI:
     # connection. CARLA must already be running.
     # --------------------------------------------------------------------
     def _run_carla_snippet(self, snippet: str, args: list[str], prefix: str):
+        """Run a one-shot carla-env snippet, fire-and-forget. For
+        long-lived snippets the caller wants the proc handle back; use
+        the returned value (None when carla-env is missing)."""
         if not CARLA_PYTHON.exists():
             self._log(f'[ui] carla python missing: {CARLA_PYTHON}')
-            return
+            return None
         cmd = [str(CARLA_PYTHON), '-c', snippet] + args
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -834,6 +923,7 @@ class ADASUI:
         )
         threading.Thread(target=self._stream, args=(proc, prefix),
                          daemon=True).start()
+        return proc
 
     def apply_weather(self):
         preset = self.weather_var.get()
@@ -844,11 +934,27 @@ class ADASUI:
     def spawn_traffic(self):
         n = self.traffic_var.get()
         port = self.port_var.get()
+        # Kill the previous spawner first — the snippet is a forever
+        # heartbeat loop, so without this every Spawn click would leave
+        # an extra background process re-asserting autopilot on the
+        # same vehicles. Replacing means the user can re-click Spawn
+        # safely (e.g. to change N) without pile-up.
+        self._terminate(self.npc_spawn_proc, 'NPC spawner')
+        self.npc_spawn_proc = None
         self._log(f'[ui] spawning {n} NPC vehicles on port {port}')
-        self._run_carla_snippet(_TRAFFIC_SPAWN_SNIPPET, [n, port], 'traffic')
+        self.npc_spawn_proc = self._run_carla_snippet(
+            _TRAFFIC_SPAWN_SNIPPET, [n, port], 'traffic')
 
     def clear_traffic(self):
         port = self.port_var.get()
+        # Kill the heartbeat FIRST. If we destroyed the actors while it
+        # was still running, the next 5-second tick would see them
+        # already gone and re-spawn nothing, but during the destroy
+        # window the heartbeat could race the clear and re-assert
+        # autopilot on a half-destroyed actor. Killing first keeps the
+        # teardown deterministic.
+        self._terminate(self.npc_spawn_proc, 'NPC spawner')
+        self.npc_spawn_proc = None
         self._log(f'[ui] clearing NPC traffic on port {port}')
         self._run_carla_snippet(_TRAFFIC_CLEAR_SNIPPET, [port], 'traffic')
 
@@ -1006,6 +1112,12 @@ def main():
         # Tear down what we own, in reverse-start order. Flush any in-flight
         # video recording first so the .mp4 has a valid trailer.
         app._stop_recording()
+        # Kill the NPC heartbeat spawner before anything else — it's
+        # the only one we created with start_new_session=True that has
+        # no other lifecycle hook, so if we forget it it'll keep
+        # running headless after the UI closes.
+        app._terminate(app.npc_spawn_proc, 'NPC spawner')
+        app.npc_spawn_proc = None
         app.stop_stack()
         app.stop_bridge()
         app.stop_carla()
