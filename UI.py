@@ -62,19 +62,28 @@ CAMERA_TOPIC       = '/Car_1/camera/front/compressed'
 ACC_DEBUG_TOPIC    = '/ACC/perception/debug_image'
 LKAS_DEBUG_TOPIC   = '/LKAS/perception/debug_image'
 FUSED_DEBUG_TOPIC  = '/ADAS/perception/debug_image'
+IPM_DEBUG_TOPIC    = '/ADAS/ipm/debug_image'
 CMD_VEL_TOPIC      = '/Car_1/cmd_vel'
 CMD_STEER_TOPIC    = '/Car_1/cmd_steer'
 SPEED_TOPIC        = '/Car_1/vehicle/speed'
 
 # Display-name → topic for the camera-source selector. The debug topics
-# carry YOLO bounding boxes (ACC), UFLD ego-lane polylines (LKAS), and the
-# combined view (ADAS) drawn server-side by the perception nodes.
+# carry YOLO bounding boxes (ACC), UFLD ego-lane polylines (LKAS), and
+# the combined view (ADAS), drawn server-side by the perception nodes.
+# IPM_DEBUG_TOPIC has its own permanent BEV panel to the right of the
+# camera (see _build_ui), so it's intentionally NOT in this dict.
 CAMERA_SOURCES = {
-    'Raw':            CAMERA_TOPIC,
-    'ACC (YOLO)':     ACC_DEBUG_TOPIC,
-    'LKAS (UFLD)':    LKAS_DEBUG_TOPIC,
+    'Raw':              CAMERA_TOPIC,
+    'ACC (YOLO)':       ACC_DEBUG_TOPIC,
+    'LKAS (UFLD)':      LKAS_DEBUG_TOPIC,
     'ADAS (YOLO+UFLD)': FUSED_DEBUG_TOPIC,
 }
+
+# BEV display widget — native IPM image is 320×480 (see ipm_view_node).
+# We render at 1.125× upscale to make it more legible without being
+# huge. Aspect ratio (2:3) is preserved in the BEV-only render path.
+BEV_W = 320
+BEV_H = 480
 
 # A node is "alive" if its heartbeat topic has published within this window.
 NODE_ALIVE_WINDOW_S = 1.5
@@ -300,6 +309,10 @@ class TelemetryView(Node):
     def __init__(self):
         super().__init__('adas_ui_telemetry')
         self.latest_jpegs = {t: None for t in CAMERA_SOURCES.values()}
+        # IPM lives outside CAMERA_SOURCES (separate widget, not source-
+        # selectable). Tracked independently so the BEV panel's render
+        # path doesn't go through _active_camera_topic / latest_jpegs.
+        self.latest_bev_jpeg: bytes | None = None
         self.last_seen: dict[str, float] = {}
         # Ego speed in m/s. None until the bridge publishes a first sample.
         self.speed_mps: float | None = None
@@ -308,6 +321,8 @@ class TelemetryView(Node):
             self.create_subscription(
                 CompressedImage, topic,
                 lambda msg, t=topic: self._on_image(t, msg), 10)
+        self.create_subscription(
+            CompressedImage, IPM_DEBUG_TOPIC, self._on_bev, 10)
         self.create_subscription(
             Twist, CMD_VEL_TOPIC,
             lambda _msg: self._touch(CMD_VEL_TOPIC), 10)
@@ -325,6 +340,11 @@ class TelemetryView(Node):
         # Stash raw bytes; let the render tick decide whether to decode.
         self.latest_jpegs[topic] = bytes(msg.data)
         self._touch(topic)
+
+    def _on_bev(self, msg):
+        # Same idea as _on_image but for the always-on BEV panel.
+        self.latest_bev_jpeg = bytes(msg.data)
+        self._touch(IPM_DEBUG_TOPIC)
 
     def _touch(self, topic: str):
         self.last_seen[topic] = time.monotonic()
@@ -371,6 +391,9 @@ class ADASUI:
         self._render_after = None
         self._last_rendered_jpeg: bytes | None = None  # avoid re-decoding the same frame
         self._last_bgr: np.ndarray | None = None        # last decoded BGR frame (for video writer)
+        # BEV (always-on /ADAS/ipm/debug_image) — same idempotency trick
+        # so we don't re-decode a jpeg we already painted.
+        self._last_rendered_bev_jpeg: bytes | None = None
 
         # Video recorder. None when idle; cv2.VideoWriter while recording.
         # Records whatever the camera widget is currently showing — switching
@@ -391,6 +414,10 @@ class ADASUI:
         outer.grid(row=0, column=0, sticky='nsew')
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        # Column 0 = controls (fixed width), col 1 = camera + log (grows
+        # with window width), col 2 = permanent BEV panel (fixed width).
+        # weight=1 only on col 1 so the BEV preserves its native aspect
+        # without stretching when the window is resized.
         outer.columnconfigure(1, weight=1)
         outer.rowconfigure(0, weight=1)
 
@@ -590,6 +617,27 @@ class ADASUI:
                                               font=('Monospace', 9), wrap='word')
         self.log.grid(row=0, column=0, sticky='nsew')
 
+        # ── Permanent BEV panel (column 2 of outer) ─────────────────────
+        # Always subscribed to /ADAS/ipm/debug_image — distinct from the
+        # source-switchable camera widget on its left, so the operator
+        # can see the BEV simultaneously with whichever camera source is
+        # selected. Native IPM is 320×480, rendered here at BEV_W × BEV_H
+        # with aspect preserved (see _render_bev_frame).
+        self._bev_frame = ttk.LabelFrame(outer, text='BEV — /ADAS/ipm/debug_image',
+                                         padding=4)
+        self._bev_frame.grid(row=0, column=2, sticky='ns', padx=(8, 0))
+        self._bev_placeholder_photo = tk.PhotoImage(width=BEV_W, height=BEV_H)
+        bev_placeholder = ('waiting for IPM frame…'
+                           if CAMERA_AVAILABLE
+                           else f'BEV disabled: {_camera_err}')
+        self.bev_label = tk.Label(self._bev_frame, background='#222222',
+                                  anchor='center', text=bev_placeholder,
+                                  foreground='#aaaaaa',
+                                  image=self._bev_placeholder_photo,
+                                  compound='center')
+        self.bev_label.image = self._bev_placeholder_photo
+        self.bev_label.grid(row=0, column=0, sticky='ns')
+
     # --------------------------------------------------------------------
     # Logging
     # --------------------------------------------------------------------
@@ -646,6 +694,15 @@ class ADASUI:
                     self._last_rendered_jpeg = jpeg
             if self._video_writer is not None and self._last_bgr is not None:
                 self._record_frame(self._last_bgr)
+            # BEV panel — independent of the source-selector camera. Same
+            # decode-only-if-new pattern.
+            bev_jpeg = self.ros_node.latest_bev_jpeg
+            if bev_jpeg is not None and bev_jpeg is not self._last_rendered_bev_jpeg:
+                arr = np.frombuffer(bev_jpeg, dtype=np.uint8)
+                bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if bgr is not None:
+                    self._render_bev_frame(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                    self._last_rendered_bev_jpeg = bev_jpeg
             self._refresh_status_dots()
             self._refresh_speed_label()
         self.root.after(int(1000 / CAMERA_UI_HZ), self._render_tick)
@@ -768,6 +825,27 @@ class ADASUI:
         photo = ImageTk.PhotoImage(img)
         self.camera_label.configure(image=photo, text='')
         self.camera_label.image = photo  # keep a reference; Tk won't otherwise
+
+    def _render_bev_frame(self, rgb):
+        # BEV panel — fixed target size BEV_W × BEV_H, aspect preserved.
+        # IMPORTANT: do NOT use self.bev_label.winfo_width() here as the
+        # target. The label resizes to fit each PhotoImage we set, which
+        # nudges winfo_width() up; next tick that becomes the new target
+        # and the panel grows again. Because the BEV column has no grid
+        # weight (so the window doesn't clamp it), this feedback loop
+        # snowballs frame-by-frame until the BEV consumes the whole UI.
+        # Pinning the target to the constants kills the loop.
+        h, w = rgb.shape[:2]
+        scale = min(BEV_W / w, BEV_H / h)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        if (new_w, new_h) != (w, h):
+            rgb = cv2.resize(rgb, (new_w, new_h),
+                             interpolation=cv2.INTER_NEAREST)
+        img = Image.fromarray(rgb)
+        photo = ImageTk.PhotoImage(img)
+        self.bev_label.configure(image=photo, text='')
+        self.bev_label.image = photo  # keep a reference; Tk won't otherwise
 
     # --------------------------------------------------------------------
     # Subprocess helpers
@@ -1105,7 +1183,10 @@ class ADASUI:
 def main():
     root = tk.Tk()
     # Leave headroom around the 960×540 camera for the left controls + log.
-    root.geometry('1320x820')
+    # Widened from 1320 → 1720 to fit the permanent BEV panel (BEV_W=360
+    # + LabelFrame padding) to the right of the camera. Camera column
+    # keeps its previous size — the new width is added, not redistributed.
+    root.geometry('1720x820')
     app = ADASUI(root)
 
     def on_close():

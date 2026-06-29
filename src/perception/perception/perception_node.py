@@ -15,7 +15,7 @@ torch.set_num_interop_threads(2)
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Bool
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CompressedImage
@@ -61,11 +61,12 @@ VEHICLE_CLASSES     = {'car', 'truck', 'bus', 'motorcycle'}
 # controller resets state when d ≤ 0), but well below
 # `emergency_distance` so the controller's EMERGENCY brake fires.
 MIN_PUBLISHED_GAP_M = 0.1
-LANE_HALF_M       = 1.75   # half a CARLA Town lane (~3.5 m wide)
-EXTRAP_MAX_M      = 10.0   # how far past a polyline tip we trust extrapolation
-                            # (was 5 — too tight; rejected real far-range leads
-                            # whose X exceeded UFLD's short polyline tips,
-                            # forcing the centre-strip fallback to catch them)
+# Centerline is now strict-overlap only: it exists only where both
+# UFLD polylines reach the same X. No half-lane offset for the
+# single-polyline case, no forward extrapolation past either polyline
+# tip. Both fallbacks inherited UFLD's per-polyline drift and shifted
+# the centerline by up to ~0.5 m, which was enough to flip the
+# bb-intersects-centerline gate on cars just outside the ego lane.
 
 
 class YoloDetection(Node):
@@ -101,6 +102,17 @@ class YoloDetection(Node):
         self.create_subscription(
             Path, '/LKAS/ego_lane_right',
             lambda m: self._on_lane('right', m), 10)
+        # Bridge sets True while ego is inside a CARLA junction zone.
+        # We only allow the centre-strip safety net to fire when this
+        # is True — outside junctions the centerline gate is the sole
+        # authority, and a missing centerline means "no ACC", not
+        # "guess via image-space". UFLD is intentionally paused inside
+        # junction zones, so without this fallback ACC would also be
+        # blind through every intersection.
+        self._in_junction = False
+        self.create_subscription(
+            Bool, '/Car_1/in_junction',
+            self._on_in_junction, 10)
 
         # Publishers
         self.dist_pub  = self.create_publisher(Float32,          '/ACC/lead_vehicle_distance',   10)
@@ -112,10 +124,9 @@ class YoloDetection(Node):
         # Empty path when no in-lane lead.
         self.bb_ground_pub = self.create_publisher(Path,         '/ACC/lead_bb_ground',          10)
         # Interpolated centerline — exactly what `_centerline_at` returns,
-        # sampled at 1 m intervals out to the longer polyline's tip plus
-        # EXTRAP_MAX_M. Single source of truth so the BEV overlay matches
-        # the corridor the in-lane gate is actually using to filter
-        # detections. Consumed by ipm_view_node.
+        # sampled at 1 m intervals across the overlap of the two UFLD
+        # polylines (single source of truth so the BEV overlay matches
+        # the corridor the gate uses). Consumed by ipm_view_node.
         self.centerline_pub = self.create_publisher(Path,        '/LKAS/centerline_debug',       10)
 
         # Centerline is published from inside estimateLeadDist (per
@@ -179,6 +190,9 @@ class YoloDetection(Node):
         else:
             self.right_veh = veh
 
+    def _on_in_junction(self, msg: Bool):
+        self._in_junction = bool(msg.data)
+
     def _pixel_to_vehicle(self, u: float, v: float, img_w: int, img_h: int):
         """Inverse-perspective-project an image pixel onto the road
         plane. Returns (X_forward, Y_left) in metres, or None for
@@ -193,6 +207,44 @@ class YoloDetection(Node):
         forward = self.cam_x_off + self.cam_h_m * focal_px / dv
         y_right = self.cam_h_m * (u - cx) / dv
         return forward, -y_right   # flip to ROS / REP 103 (Y left positive)
+
+    def _project_polyline_to_image(self, polyline_veh, img_w, img_h):
+        """Forward-project a vehicle-frame polyline back into the camera
+        image. Returns a list of (u, v) tuples — the polyline traced
+        on the image as the gate sees it. Inverse of _pixel_to_vehicle:
+        for each (x_fwd, y_left), recovers the image pixel that lies
+        on the road plane at that point. Used to build the lane-shape
+        trapezoid keep-zone in image space (gate excludes detections
+        whose bbox-center is outside the projected lane corridor)."""
+        focal_px = img_w / (2.0 * math.tan(self.CAM_FOV_RAD / 2.0))
+        cx, cy = img_w / 2.0, img_h / 2.0
+        out = []
+        for x_fwd, y_left in polyline_veh:
+            depth = x_fwd - self.cam_x_off
+            if depth < 0.05:                          # behind / on the camera
+                continue
+            v = cy + self.cam_h_m * focal_px / depth
+            u = cx - y_left * focal_px / depth
+            out.append((u, v))
+        return out
+
+    @staticmethod
+    def _interp_u_at_v(projected, v_target):
+        """Linear-interpolate u along a projected polyline at the given
+        image row v_target. Returns None when v_target is outside the
+        polyline's v range (UFLD didn't reach that depth in image)."""
+        if len(projected) < 2:
+            return None
+        for i in range(len(projected) - 1):
+            u0, v0 = projected[i]
+            u1, v1 = projected[i + 1]
+            v_min, v_max = (v0, v1) if v0 <= v1 else (v1, v0)
+            if v_min <= v_target <= v_max:
+                if v1 == v0:
+                    return u0
+                t = (v_target - v0) / (v1 - v0)
+                return u0 + t * (u1 - u0)
+        return None
 
     @staticmethod
     def _interp_y_at_x(polyline: list[tuple[float, float]], x_target: float):
@@ -214,83 +266,78 @@ class YoloDetection(Node):
     
 
     def _centerline_at(self, x_fwd: float) -> float | None:
-        """Lane centerline Y_left at the given X_forward. Four cases:
-          - both polylines reach X → midpoint
-          - only left  reaches X → left_y  - LANE_HALF_M  (centerline
-                                              is one half-lane to the right)
-          - only right reaches X → right_y + LANE_HALF_M
-          - neither reaches X    → bounded forward extrapolation of
-                                              whichever polyline got furthest
-        Returns None only when there is no usable signal at this X.
+        """Lane centerline Y_left at the given X_forward. Strict overlap:
+        returns the midpoint of the left and right UFLD polylines only
+        when *both* reach this X. No half-lane offset for single-polyline
+        cases, no forward extrapolation past either tip.
+
+        Returns None outside the overlap zone — caller falls back to
+        the image-space centre-strip safety net.
+
+        Earlier variants synthesised the centerline from one polyline
+        with a fixed half-lane offset, or extrapolated the further
+        polyline forward by a bounded distance. Both inherited UFLD's
+        per-polyline drift directly into the centerline and shifted it
+        by up to ~0.5 m, which was enough to flip the gate decision on
+        cars sitting just outside the ego lane.
         REP 103 axes: Y positive = left of ego."""
-        left_y  = self._interp_y_at_x(self.left_veh,  x_fwd)
-        right_y = self._interp_y_at_x(self.right_veh, x_fwd)
-        if left_y is not None and right_y is not None:
-            return 0.5 * (left_y + right_y)
-        if left_y is not None:
-            return left_y - LANE_HALF_M
-        if right_y is not None:
-            return right_y + LANE_HALF_M
-        return self._extrapolate_centerline(x_fwd)
-
-    def _extrapolate_centerline(self, x_fwd: float) -> float | None:
-        """Project the polyline that reaches furthest forward using its
-        last-segment slope, up to EXTRAP_MAX_M past its tip. Bounded so
-        a junction-induced UFLD drop-out can't let the gate hallucinate
-        a lane out to infinity."""
-        candidates = []   # (x_tip, polyline, centerline_offset)
-        for polyline, offset in ((self.left_veh,  -LANE_HALF_M),
-                                 (self.right_veh, +LANE_HALF_M)):
-            if len(polyline) >= 2:
-                candidates.append((polyline[-1][0], polyline, offset))
-        if not candidates:
-            return None
-        # Use the polyline whose tip reaches furthest forward → smallest
-        # extrapolation distance for this X.
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        x_tip, polyline, offset = candidates[0]
-        if x_fwd <= x_tip or (x_fwd - x_tip) > EXTRAP_MAX_M:
-            return None
-        x_prev, y_prev = polyline[-2]
-        y_tip          = polyline[-1][1]
-        dx = x_tip - x_prev
-        slope = (y_tip - y_prev) / dx if abs(dx) > 1e-3 else 0.0
-        return (y_tip + slope * (x_fwd - x_tip)) + offset
-
-    def _in_ego_lane(self, x_fwd: float, y_left: float) -> bool | None:
-        """ORIGINAL behaviour, restored. True iff the ground point lies
-        between the left and right UFLD polylines at this X. Returns
-        None only when either polyline can't be interpolated at this X
-        (UFLD warm-up, junction pause, or X beyond polyline range) —
-        caller falls back to the legacy image-space centre-strip filter.
-
-        The previous "centerline ± LANE_HALF_M" variant + single-polyline
-        synthesis was over-rejecting real in-lane leads when one UFLD
-        polyline went wonky, causing ACC to silently accept no leads
-        and bump into the car in front. _centerline_at is still used by
-        _publish_centerline_debug for the BEV overlay — it's just not
-        the filter any more."""
         left_y  = self._interp_y_at_x(self.left_veh,  x_fwd)
         right_y = self._interp_y_at_x(self.right_veh, x_fwd)
         if left_y is None or right_y is None:
             return None
-        lo, hi = sorted((left_y, right_y))
-        return lo <= y_left <= hi
+        return 0.5 * (left_y + right_y)
+
+    def _bb_intersects_centerline(self, left_g: tuple[float, float],
+                                  right_g: tuple[float, float]) -> bool | None:
+        """True iff the lane centerline at the lead's forward distance
+        passes through (or touches) the horizontal segment spanned by
+        the bb's two bottom corners in BEV.
+
+        Geometric intuition: both bb-bottom corners are projected via
+        IPM to the road plane and share the same X_forward (same image
+        v → same depth in the pinhole model), differing only in Y_left.
+        That makes the bb's ground footprint a horizontal segment in
+        BEV. If the centerline polyline crosses this segment (i.e. its
+        Y at this X falls inside the segment's [y_lo, y_hi]), the lead
+        is sitting over the lane centre → engage ACC. Otherwise the
+        lead is off to the side → ignore.
+
+        Why this is better than the old "bb-center within ±half-lane
+        of centerline" or "bb-center between left and right polylines"
+        gates:
+          * uses the bb's *full* width as the tolerance, so a wide
+            close lead needs less precise centerline alignment than a
+            narrow far one — self-scaling
+          * correctly admits lane-changers whose footprint partially
+            overhangs the centerline
+          * cleanly rejects parked / oncoming cars whose footprint sits
+            entirely off-corridor, even when UFLD polylines drift
+
+        Returns None when _centerline_at has no signal at this X
+        (only one polyline reaches X, or neither does) — caller falls
+        back to the image-space centre-strip safety net."""
+        x_fwd = left_g[0]  # == right_g[0] (same image v → same depth)
+        yc = self._centerline_at(x_fwd)
+        if yc is None:
+            return None
+        y_lo, y_hi = sorted((left_g[1], right_g[1]))
+        return y_lo <= yc <= y_hi
 
     def _publish_centerline_debug(self, header):
-        """Sample _centerline_at at 1 m intervals out to the longer
-        polyline's tip + EXTRAP_MAX_M and publish the result as a Path.
-        Reuses the exact gate logic — what shows up on the BEV is what
-        the in-lane filter is using to accept/reject detections. Empty
-        path means the gate has no usable centerline (UFLD silent /
-        both polylines too short to extrapolate)."""
+        """Sample _centerline_at at 1 m intervals across the overlap of
+        both polylines and publish the result as a Path. Same logic as
+        the gate, so the red BEV overlay shows exactly the centerline
+        used to accept/reject detections. Empty path → no overlap zone
+        (one or both polylines are too short)."""
         path = Path()
         path.header = header
         path.header.frame_id = 'base_link'
+        # Sample only across the overlap of the two polylines (the
+        # shorter tip bounds the centerline length). Beyond that,
+        # _centerline_at returns None and there's nothing to draw.
         max_x = 0.0
-        for polyline in (self.left_veh, self.right_veh):
-            if len(polyline) >= 2:
-                max_x = max(max_x, polyline[-1][0] + EXTRAP_MAX_M)
+        if len(self.left_veh) >= 2 and len(self.right_veh) >= 2:
+            max_x = min(self.left_veh[-1][0], self.right_veh[-1][0])
         x = 1.0
         while x <= max_x:
             y = self._centerline_at(x)
@@ -360,32 +407,71 @@ class YoloDetection(Node):
             if conf < MIN_CONFIDENCE:
                 continue
 
-            # IPM-project the bottom-centre of the bb to a ground point
-            # in vehicle frame (REP 103: X forward, Y left). This single
-            # pixel anchors both the lane-ROI filter *and* the published
-            # distance — same projection, no second model. See DEBUG §22.
             box_center_x = (x_min + x_max) / 2
-            box_bottom_y = y_max
-            ground = self._pixel_to_vehicle(box_center_x, box_bottom_y, w, h)
-            if ground is None:
+
+            # Side-pass guard: a vehicle directly beside the ego in an
+            # adjacent lane (overtaking or being overtaken) usually
+            # appears as a bbox clipped against exactly ONE image side.
+            # Its bb-bottom is then often clipped at the image bottom
+            # too — the IPM projection saturates to forward ≈ 3 m and
+            # the bb's wide ground footprint spans the lane centerline,
+            # falsely triggering the gate and the EMERGENCY brake. A
+            # genuine in-front lead is centred: either both sides
+            # clipped (very wide truck) or neither — never just one.
+            # XOR of left/right clip discriminates the side-pass case
+            # without rejecting real centred close leads.
+            clipped_left  = x_min <= 5
+            clipped_right = x_max >= w - 5
+            if clipped_left ^ clipped_right:
+                continue
+
+            # Lane-shape keep-zone trapezoid (matches operator's hand-
+            # drawn exclusion sketch). Detections in the lower band
+            # whose bbox-centre falls OUTSIDE a central column are
+            # dropped — the column has half-width 0.07·w at the top
+            # of the band (near the vanishing point) and 0.25·w at
+            # the image bottom (closest range). Geometry mirrors the
+            # ego-lane's image-space silhouette, so passing cars in
+            # adjacent lanes (bbox-centres in the bottom-LEFT or
+            # bottom-RIGHT wedge) are rejected, while a real close
+            # lead centred ahead always lies inside the column.
+            if y_max > h * 0.55:
+                t = (y_max - h * 0.55) / (h - h * 0.55)   # 0 → 1
+                keep_half_w = w * (0.07 + 0.18 * t)        # 0.07 → 0.25
+                if abs(box_center_x - img_center_x) > keep_half_w:
+                    continue
+
+            # IPM-project BOTH bb-bottom corners up front: they feed
+            # the gate (centerline-intersects-bb-segment test) AND the
+            # BEV visualisation. Same v (y_max) for both → same
+            # X_forward; only Y_left differs, so this is a horizontal
+            # ground segment in BEV.
+            left_g  = self._pixel_to_vehicle(x_min, y_max, w, h)
+            right_g = self._pixel_to_vehicle(x_max, y_max, w, h)
+            if left_g is None or right_g is None:
                 # bb-bottom at or above horizon — can't ground-project.
                 continue
 
             if USE_LANE_ROI:
-                in_lane = self._in_ego_lane(*ground)
+                in_lane = self._bb_intersects_centerline(left_g, right_g)
                 if in_lane is False:
                     continue
                 if in_lane is None:
-                    # _centerline_at has no signal at this X — both
-                    # polylines too short to interp *and* both too short
-                    # to extrapolate. Rather than going blind (the
-                    # last revision dropped here and ACC bumped into
-                    # real leads when UFLD was silent), fall back to
-                    # the legacy image-space centre-strip as a safety
-                    # net. Wide enough to admit reasonable in-lane
-                    # candidates, narrow enough to still reject the
-                    # shoulder-taxi case that motivated the gate.
-                    if abs(box_center_x - img_center_x) > w * 0.2:
+                    # _centerline_at has no signal at this X. The
+                    # image-space centre-strip safety net (±5 % of
+                    # image width) is the only thing we can fall back
+                    # to — but it knows nothing about the road, so we
+                    # only let it fire when the bridge tells us we're
+                    # inside a junction zone (UFLD is intentionally
+                    # paused there). Outside junctions, "no centerline"
+                    # should be rare and probably means UFLD lost a
+                    # polyline briefly; dropping the detection is
+                    # safer than guessing via image-space, which was
+                    # admitting passing/oncoming cars that just
+                    # happened to land near the image centre.
+                    if not self._in_junction:
+                        continue
+                    if abs(box_center_x - img_center_x) > w * 0.05:
                         continue
             elif abs(box_center_x - img_center_x) > w * 0.2:
                 continue
@@ -397,18 +483,12 @@ class YoloDetection(Node):
             # still trips the controller's EMERGENCY brake instead of
             # being filtered out as d ≤ 0.
             distance_m = max(MIN_PUBLISHED_GAP_M,
-                             ground[0] - self.ego_extent_x)
+                             left_g[0] - self.ego_extent_x)
 
             if min_distance is None or distance_m < min_distance:
                 min_distance = distance_m
                 best_conf    = float(conf)   # track conf of selected lead
-                # Project both bb-bottom corners for BEV visualisation.
-                # Same v (y_max) for both → same X_forward; only Y differs,
-                # so the BEV line will be horizontal at the lead's range.
-                left_g  = self._pixel_to_vehicle(x_min, y_max, w, h)
-                right_g = self._pixel_to_vehicle(x_max, y_max, w, h)
-                closest_bb_ground = (left_g, right_g) \
-                    if (left_g is not None and right_g is not None) else None
+                closest_bb_ground = (left_g, right_g)
 
             # Draw bounding box on debug image
             label = f"{class_name} {conf:.2f}  {distance_m:.1f}m"
@@ -450,6 +530,26 @@ class YoloDetection(Node):
         # the BEV centerline updates slower too — accepted tradeoff
         # since the MultiThreadedExecutor alternative destabilised YOLO.
         self._publish_centerline_debug(header)
+
+        # ── DEBUG: keep-zone trapezoid preview (TEMP) ─────────
+        # Yellow outline of the lane-shape keep-zone — anything whose
+        # bbox-centre lies outside this trapezoid in the lower band is
+        # rejected before reaching the BEV gate. Same numbers as the
+        # gate above so the operator can verify alignment with the
+        # hand-drawn target. Remove once the geometry is confirmed.
+        y_top  = int(h * 0.55)
+        h_top  = int(w * 0.07)   # half-width at top of band
+        h_bot  = int(w * 0.25)   # half-width at image bottom
+        c_img  = w // 2
+        trap_pts = np.array([
+            (c_img - h_top, y_top),
+            (c_img + h_top, y_top),
+            (c_img + h_bot, h - 1),
+            (c_img - h_bot, h - 1),
+        ], dtype=np.int32)
+        cv2.polylines(img, [trap_pts], isClosed=True,
+                      color=(0, 255, 255), thickness=2,
+                      lineType=cv2.LINE_AA)
 
         # ── Debug image → Foxglove ────────────────────────────
         _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])
