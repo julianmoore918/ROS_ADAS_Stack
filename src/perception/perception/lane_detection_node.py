@@ -50,7 +50,7 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32
 
 import torch
 torch.set_num_threads(2)
@@ -130,6 +130,21 @@ class UFLDInference:
         num_grid_row = loc_row.shape[1]
         num_cls_row = loc_row.shape[2]
 
+        # ── NEW: soft confidences from the same logits (before argmax discards them)
+        exist_soft = self._torch.softmax(exist_row, dim=1)[:, 1]   # (1, num_row, num_lanes)
+        loc_soft   = self._torch.softmax(loc_row,   dim=1)         # (1, C, num_row, num_lanes)
+        pos_peak   = loc_soft.max(dim=1).values                     # (1, num_row, num_lanes)
+
+        def lane_conf(lane_idx: int) -> float:
+            mask = exist_soft[0, :, lane_idx] > 0.5
+            if mask.sum() == 0:
+                return 0.0
+            return float((exist_soft[0, mask, lane_idx]
+                        * pos_peak[0, mask, lane_idx]).mean())
+
+        left_conf  = lane_conf(1)   # ego_left
+        right_conf = lane_conf(2)   # ego_right
+
         max_idx = loc_row.argmax(1)
         valid = exist_row.argmax(1)
 
@@ -152,8 +167,7 @@ class UFLDInference:
                 y = self.row_anchor[k] * img_h
                 pts.append((int(round(x)), int(round(y))))
             polylines[key] = pts
-        return polylines['ego_left'], polylines['ego_right']
-
+        return polylines['ego_left'], polylines['ego_right'], left_conf, right_conf
 
 class LaneDetectionNode(Node):
     def __init__(self):
@@ -187,9 +201,16 @@ class LaneDetectionNode(Node):
         self.cam_x_off  = self.get_parameter('cam_x_offset').value
         self.skip_n     = max(1, int(self.get_parameter('inference_skip_n').value))
 
-        # ── Resolve weights from the package share dir ───────────────────
+        # ── Resolve weights ─────────────────────────────────────────────
+        # `model_filename` accepts either a bare filename (resolved
+        # against `share/perception/models/`) or an absolute path (used
+        # by the UI dropdown when the operator wants to point at a
+        # freshly-trained checkpoint outside the package).
         pkg_share = get_package_share_directory('perception')
-        model_path = os.path.join(pkg_share, 'models', model_name)
+        if os.path.isabs(model_name):
+            model_path = model_name
+        else:
+            model_path = os.path.join(pkg_share, 'models', model_name)
         cfg_path = os.path.join(ufld_repo, cfg_rel)
 
         self.get_logger().info("=== Lane Detection Node starting ===")
@@ -215,6 +236,10 @@ class LaneDetectionNode(Node):
         self.right_pub = self.create_publisher(Path, 'ego_lane_right', 10)
         self.debug_pub = self.create_publisher(CompressedImage,
                                                'perception/debug_image', 10)
+        # NEW — per-lane soft confidence (YOLO-analogue). Range [0, 1].
+        # 0.0 during junctions and when the lane isn't detected.
+        self.left_conf_pub  = self.create_publisher(Float32, 'ego_lane_left_conf',  10)
+        self.right_conf_pub = self.create_publisher(Float32, 'ego_lane_right_conf', 10)
 
         # Warn periodically if no frames are arriving on the camera topic.
         self.cam_topic = cam_topic
@@ -272,12 +297,26 @@ class LaneDetectionNode(Node):
             path.poses.append(pose)
         return path
 
-    def annotate(self, bgr, left_px, right_px):
+    def annotate(self, bgr, left_px, right_px, left_conf=0.0, right_conf=0.0):
         out = bgr.copy()
         for u, v in left_px:
             cv2.circle(out, (u, v), 4, (255, 80, 80), -1)
         for u, v in right_px:
             cv2.circle(out, (u, v), 4, (80, 255, 80), -1)
+
+        # Confidence overlay — top-left corner. Colour tiered so a glance
+        # tells you if the lane is trusted: green ≥ 0.7, yellow 0.3-0.7,
+        # red < 0.3. Two rows: L (ego-left, blue), R (ego-right, green).
+        def _conf_colour(c: float):
+            if c >= 0.7: return (60, 220, 60)     # green
+            if c >= 0.3: return (60, 220, 220)    # yellow
+            return (60, 60, 220)                  # red
+        cv2.putText(out, f'L: {left_conf:.2f}',  (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    _conf_colour(left_conf), 2, cv2.LINE_AA)
+        cv2.putText(out, f'R: {right_conf:.2f}', (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    _conf_colour(right_conf), 2, cv2.LINE_AA)
         return out
 
     # ─────────────────────────────────────────────────────────────────────
@@ -314,9 +353,13 @@ class LaneDetectionNode(Node):
             empty_header.frame_id = self.frame_id
             self.left_pub.publish(self.to_path([], empty_header))
             self.right_pub.publish(self.to_path([], empty_header))
+            # NEW — zero confidence during junctions
+            zero = Float32(); zero.data = 0.0
+            self.left_conf_pub.publish(zero)
+            self.right_conf_pub.publish(zero)
             overlay = bgr.copy()
             cv2.putText(overlay, 'JUNCTION (UFLD paused)', (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+                        cv2.FONT_HERSHEY_COMPLEX_SMALL, 0.9, (0, 0, 0), 2)
             _, buf = cv2.imencode('.jpg', overlay,
                                   [cv2.IMWRITE_JPEG_QUALITY, 85])
             dbg = CompressedImage()
@@ -326,14 +369,19 @@ class LaneDetectionNode(Node):
             self.debug_pub.publish(dbg)
             return
 
-        left_px, right_px = self.infer(bgr, img_w, img_h)
+        left_px, right_px, left_conf, right_conf = self.infer(bgr, img_w, img_h)
         left_veh  = self.polyline_to_vehicle(left_px,  img_w, img_h)
         right_veh = self.polyline_to_vehicle(right_px, img_w, img_h)
 
         self.left_pub.publish(self.to_path(left_veh,   msg.header))
         self.right_pub.publish(self.to_path(right_veh, msg.header))
 
-        annotated = self.annotate(bgr, left_px, right_px)
+        # NEW — publish confidence alongside polylines
+        lc = Float32(); lc.data = float(left_conf);  self.left_conf_pub.publish(lc)
+        rc = Float32(); rc.data = float(right_conf); self.right_conf_pub.publish(rc)
+
+        annotated = self.annotate(bgr, left_px, right_px,
+                                  left_conf, right_conf)
         _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
         dbg = CompressedImage()
         dbg.header = msg.header

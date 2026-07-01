@@ -27,7 +27,6 @@ from ament_index_python.packages import get_package_share_directory
 # ========================
 # CONFIG FLAGS
 # ========================
-USE_ROI             = False   # ← flip to True to enable static-polygon ROI mask
 # Filter YOLO detections to those whose ground-projected (X, Y) lies
 # between UFLD's ego-left and ego-right Paths in the vehicle frame.
 # Re-uses the same IPM the lane_detection_node uses to project pixels to
@@ -73,7 +72,6 @@ class YoloDetection(Node):
     def __init__(self):
         super().__init__('Perception_Node', namespace='ACC')
         self.get_logger().info("=== Perception Node starting ===")
-        self.get_logger().info(f"    ROI mask:   {'ON' if USE_ROI else 'OFF'}")
         self.get_logger().info(f"    Min conf:   {MIN_CONFIDENCE}")
         self.get_logger().info(f"    Publish inf: {PUBLISH_INF}")
 
@@ -133,9 +131,18 @@ class YoloDetection(Node):
         # YOLO frame). The independent 10 Hz timer attempt required
         # MultiThreadedExecutor which destabilised YOLO — reverted.
 
-        # Load YOLO model
-        pkg_share = get_package_share_directory('perception')
-        model_path = os.path.join(pkg_share, 'models', 'best.pt')
+        # Load YOLO model. `model_filename` accepts either a bare
+        # filename (resolved against share/perception/models/) or an
+        # absolute path (used by the UI dropdown when pointing at a
+        # freshly-trained checkpoint outside the package). Mirrors the
+        # same convention as lane_detection_node.model_filename.
+        self.declare_parameter('model_filename', 'best.pt')
+        model_name = self.get_parameter('model_filename').value
+        pkg_share  = get_package_share_directory('perception')
+        if os.path.isabs(model_name):
+            model_path = model_name
+        else:
+            model_path = os.path.join(pkg_share, 'models', model_name)
         self.model = YOLO(model_path)
         self.get_logger().info(f"YOLO model loaded from {model_path}")
 
@@ -207,44 +214,6 @@ class YoloDetection(Node):
         forward = self.cam_x_off + self.cam_h_m * focal_px / dv
         y_right = self.cam_h_m * (u - cx) / dv
         return forward, -y_right   # flip to ROS / REP 103 (Y left positive)
-
-    def _project_polyline_to_image(self, polyline_veh, img_w, img_h):
-        """Forward-project a vehicle-frame polyline back into the camera
-        image. Returns a list of (u, v) tuples — the polyline traced
-        on the image as the gate sees it. Inverse of _pixel_to_vehicle:
-        for each (x_fwd, y_left), recovers the image pixel that lies
-        on the road plane at that point. Used to build the lane-shape
-        trapezoid keep-zone in image space (gate excludes detections
-        whose bbox-center is outside the projected lane corridor)."""
-        focal_px = img_w / (2.0 * math.tan(self.CAM_FOV_RAD / 2.0))
-        cx, cy = img_w / 2.0, img_h / 2.0
-        out = []
-        for x_fwd, y_left in polyline_veh:
-            depth = x_fwd - self.cam_x_off
-            if depth < 0.05:                          # behind / on the camera
-                continue
-            v = cy + self.cam_h_m * focal_px / depth
-            u = cx - y_left * focal_px / depth
-            out.append((u, v))
-        return out
-
-    @staticmethod
-    def _interp_u_at_v(projected, v_target):
-        """Linear-interpolate u along a projected polyline at the given
-        image row v_target. Returns None when v_target is outside the
-        polyline's v range (UFLD didn't reach that depth in image)."""
-        if len(projected) < 2:
-            return None
-        for i in range(len(projected) - 1):
-            u0, v0 = projected[i]
-            u1, v1 = projected[i + 1]
-            v_min, v_max = (v0, v1) if v0 <= v1 else (v1, v0)
-            if v_min <= v_target <= v_max:
-                if v1 == v0:
-                    return u0
-                t = (v_target - v0) / (v1 - v0)
-                return u0 + t * (u1 - u0)
-        return None
 
     @staticmethod
     def _interp_y_at_x(polyline: list[tuple[float, float]], x_target: float):
@@ -351,21 +320,6 @@ class YoloDetection(Node):
         self.centerline_pub.publish(path)
 
     # ========================
-    # STATIC ROI MASK (optional, legacy)
-    # ========================
-    def apply_roi(self, img):
-        h, w, _ = img.shape
-        polygon = np.array([[
-            (int(w * 0.1), int(h * 0.75)),
-            (int(w * 0.4), int(h * 0.40)),
-            (int(w * 0.6), int(h * 0.40)),
-            (int(w * 0.9), int(h * 0.75)),
-        ]])
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, polygon, 255)
-        return cv2.bitwise_and(img, img, mask=mask)
-
-    # ========================
     # CALLBACK
     # ========================
     def listener_callback(self, msg):
@@ -375,8 +329,11 @@ class YoloDetection(Node):
         if cv_img is None:
             return
 
-        # Optionally apply ROI
-        img_proc = self.apply_roi(cv_img) if USE_ROI else cv_img.copy()
+        # Lane-shape trapezoid (post-YOLO) is the new ROI — see the
+        # bbox-centre gate in estimateLeadDist. No pre-YOLO masking
+        # is needed; YOLO runs on the full frame and the trapezoid
+        # filters detections at the right pipeline stage.
+        img_proc = cv_img.copy()
 
         # Run YOLO
         results = self.model(img_proc, verbose=False)
@@ -425,21 +382,18 @@ class YoloDetection(Node):
             if clipped_left ^ clipped_right:
                 continue
 
-            # Lane-shape keep-zone trapezoid (matches operator's hand-
-            # drawn exclusion sketch). Detections in the lower band
-            # whose bbox-centre falls OUTSIDE a central column are
-            # dropped — the column has half-width 0.07·w at the top
-            # of the band (near the vanishing point) and 0.25·w at
-            # the image bottom (closest range). Geometry mirrors the
-            # ego-lane's image-space silhouette, so passing cars in
-            # adjacent lanes (bbox-centres in the bottom-LEFT or
-            # bottom-RIGHT wedge) are rejected, while a real close
-            # lead centred ahead always lies inside the column.
+            # Lane-shape keep-zone trapezoid — TEMPORARILY DISABLED to
+            # test whether the BEV centerline-intersection gate alone
+            # is sufficient. If passing cars still trigger emergency
+            # brake with this commented out (and the fallback below
+            # also disabled), the false positives are coming from the
+            # BEV gate itself (UFLD drift / wide bboxes / lane-changers)
+            # not from the fallback. Re-enable by uncommenting.
             if y_max > h * 0.55:
-                t = (y_max - h * 0.55) / (h - h * 0.55)   # 0 → 1
-                keep_half_w = w * (0.07 + 0.18 * t)        # 0.07 → 0.25
-                if abs(box_center_x - img_center_x) > keep_half_w:
-                    continue
+                 t = (y_max - h * 0.55) / (h - h * 0.55)   # 0 → 1
+                 keep_half_w = w * (0.05 + 0.18 * t)        # 0.07 → 0.23
+                 if abs(box_center_x - img_center_x) > keep_half_w:
+                     continue
 
             # IPM-project BOTH bb-bottom corners up front: they feed
             # the gate (centerline-intersects-bb-segment test) AND the
@@ -457,22 +411,17 @@ class YoloDetection(Node):
                 if in_lane is False:
                     continue
                 if in_lane is None:
-                    # _centerline_at has no signal at this X. The
-                    # image-space centre-strip safety net (±5 % of
-                    # image width) is the only thing we can fall back
-                    # to — but it knows nothing about the road, so we
-                    # only let it fire when the bridge tells us we're
-                    # inside a junction zone (UFLD is intentionally
-                    # paused there). Outside junctions, "no centerline"
-                    # should be rare and probably means UFLD lost a
-                    # polyline briefly; dropping the detection is
-                    # safer than guessing via image-space, which was
-                    # admitting passing/oncoming cars that just
-                    # happened to land near the image centre.
-                    if not self._in_junction:
-                        continue
-                    if abs(box_center_x - img_center_x) > w * 0.05:
-                        continue
+                    # FALLBACK DISABLED for the diagnostic test. The
+                    # gate is now strictly BEV-centerline-intersects-
+                    # bb-ground: anything we can't evaluate (no
+                    # centerline at this X) is dropped. If passing
+                    # cars still trigger emergency brake under this,
+                    # the BEV test itself is the source of false
+                    # positives (not the fallback). Original branch:
+                    #   if not self._in_junction: continue
+                    #   if abs(box_center_x - img_center_x) > w * 0.05:
+                    #       continue
+                    continue
             elif abs(box_center_x - img_center_x) > w * 0.2:
                 continue
 
@@ -538,8 +487,8 @@ class YoloDetection(Node):
         # gate above so the operator can verify alignment with the
         # hand-drawn target. Remove once the geometry is confirmed.
         y_top  = int(h * 0.55)
-        h_top  = int(w * 0.07)   # half-width at top of band
-        h_bot  = int(w * 0.25)   # half-width at image bottom
+        h_top  = int(w * 0.05)   # half-width at top of band
+        h_bot  = int(w * 0.23)   # half-width at image bottom
         c_img  = w // 2
         trap_pts = np.array([
             (c_img - h_top, y_top),

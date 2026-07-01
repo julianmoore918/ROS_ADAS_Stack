@@ -50,6 +50,30 @@ except ImportError as e:
 ADAS_WK       = Path(__file__).resolve().parent
 ADAS_INSTALL  = ADAS_WK / 'install' / 'setup.bash'
 CARLA_DIR     = Path('/home/sirius/CARLA_0.9.16')
+
+# Lane-detection model dropdown options: (display_name, model_ref).
+# `model_ref` is passed to lane_detection_node via -p model_filename:=…
+# A bare filename resolves against share/perception/models/; an absolute
+# path is used as-is. Add new trained checkpoints below as they become
+# available — no other UI code needs to change.
+LANE_MODELS: list[tuple[str, str]] = [
+    ('Current best (UFLD_best.pth)', 'UFLD_best.pth'),
+    # After the 20260701 retrain finishes, add e.g.:
+    # ('Retrained 20260701',
+    #  '/home/sirius/workspace/01_CV_Models/'
+    #  '01_Ultra_Fast_Lane_Detection_V2/logs/carla_res34/'
+    #  '20260701_092451_lr_1e-02_b_16carla_finetune/model_best.pth'),
+]
+
+# Same pattern as LANE_MODELS but for the YOLO object detector consumed
+# by perception_node. Add newly-trained YOLO checkpoints below.
+OBJECT_MODELS: list[tuple[str, str]] = [
+    ('Current best YOLO (best.pt)', 'best.pt'),
+    # Example after a retrain:
+    # ('Retrained YOLO 20260710',
+    #  '/home/sirius/workspace/Trained_YOLO/runs/detect/train2/'
+    #  'weights/best.pt'),
+]
 CARLA_SERVER  = './CarlaUE4.sh'
 CARLA_INI     = Path('/home/sirius/CARLA_0.9.16/CarlaUE4/Config/DefaultEngine.ini')
 CARLA_PYTHON  = Path('/home/sirius/CARLA_0.9.16/carla-env/bin/python3')
@@ -506,20 +530,28 @@ class ADASUI:
                      values=list(JUNCTION_POLICIES.keys()),
                      state='readonly', width=14).grid(
             row=4, column=1, sticky='w', pady=(0, 4))
+        # Rosbag recording toggle — passed as --record to the bridge at
+        # Start Bridge. Off by default (bridge used to leave a GB/min
+        # rosbag on disk every run whether the operator wanted it or
+        # not). Ticking it means the next Start Bridge will record.
+        self.rosbag_record_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(procs, text='Record rosbag',
+                        variable=self.rosbag_record_var).grid(
+            row=5, column=0, columnspan=2, sticky='w', pady=(0, 4))
         ttk.Button(procs, text='Run start_acc.sh', command=self.run_start_acc).grid(
-            row=5, column=0, columnspan=2, sticky='ew', pady=2)
-        ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
             row=6, column=0, columnspan=2, sticky='ew', pady=2)
+        ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
+            row=7, column=0, columnspan=2, sticky='ew', pady=2)
         # Foxglove bridge — independent visualisation tool. Opens
         # ws://localhost:8765 for Foxglove Studio (desktop or web).
         # Lives outside the ADAS/CARLA lifecycle so layouts can also be
         # used for rosbag playback after the stack is stopped.
         ttk.Button(procs, text='Start Foxglove',
                    command=self.start_foxglove).grid(
-            row=7, column=0, sticky='ew', pady=2)
+            row=8, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop Foxglove',
                    command=self.stop_foxglove).grid(
-            row=7, column=1, sticky='ew', pady=2, padx=(4, 0))
+            row=8, column=1, sticky='ew', pady=2, padx=(4, 0))
 
         # Feature toggles. Each row has a button (user intent — ON/OFF) and a
         # small status dot reflecting whether the backing nodes are actually
@@ -527,18 +559,51 @@ class ADASUI:
         feats = ttk.LabelFrame(left, text='Features', padding=6)
         feats.grid(row=8, column=0, columnspan=2, sticky='ew', pady=(8, 0))
         feats.columnconfigure(0, weight=1)
+
+        # ── Object-detection (YOLO) model selector, above ACC ────────
+        # Populated from OBJECT_MODELS at the top of this file. Passed
+        # to perception_node as -p model_filename:=<ref> at ACC: ON.
+        self.object_model_var = tk.StringVar(value=OBJECT_MODELS[0][0])
+        obj_row = ttk.Frame(feats)
+        obj_row.grid(row=0, column=0, columnspan=2, sticky='ew',
+                     pady=(0, 2))
+        obj_row.columnconfigure(1, weight=1)
+        ttk.Label(obj_row, text='Object model:').grid(
+            row=0, column=0, sticky='w')
+        ttk.Combobox(obj_row, textvariable=self.object_model_var,
+                     values=[d for d, _ in OBJECT_MODELS],
+                     state='readonly', width=32).grid(
+            row=0, column=1, sticky='ew', padx=(4, 0))
+
         self.acc_btn = ttk.Button(feats, text='ACC: OFF', command=self.toggle_acc)
-        self.acc_btn.grid(row=0, column=0, sticky='ew', pady=2)
+        self.acc_btn.grid(row=1, column=0, sticky='ew', pady=2)
         self.acc_status_var = tk.StringVar(value='○ idle')
         self.acc_status_lbl = ttk.Label(feats, textvariable=self.acc_status_var,
                                          foreground='#888888', width=12)
-        self.acc_status_lbl.grid(row=0, column=1, sticky='w', padx=(6, 0))
+        self.acc_status_lbl.grid(row=1, column=1, sticky='w', padx=(6, 0))
+
+        # ── Lane-detection (UFLD) model selector, above LKAS ─────────
+        # See LANE_MODELS at the top. Passed to lane_detection_node as
+        # -p model_filename:=<ref> at LKAS: ON. No filesystem scan at
+        # build time (would crash if _log ran before the log widget
+        # existed).
+        self.lane_model_var = tk.StringVar(value=LANE_MODELS[0][0])
+        model_row = ttk.Frame(feats)
+        model_row.grid(row=2, column=0, columnspan=2, sticky='ew',
+                       pady=(4, 2))
+        model_row.columnconfigure(1, weight=1)
+        ttk.Label(model_row, text='Lane model:').grid(
+            row=0, column=0, sticky='w')
+        ttk.Combobox(model_row, textvariable=self.lane_model_var,
+                     values=[d for d, _ in LANE_MODELS],
+                     state='readonly', width=32).grid(
+            row=0, column=1, sticky='ew', padx=(4, 0))
         self.lkas_btn = ttk.Button(feats, text='LKAS: OFF', command=self.toggle_lkas)
-        self.lkas_btn.grid(row=1, column=0, sticky='ew', pady=2)
+        self.lkas_btn.grid(row=3, column=0, sticky='ew', pady=2)
         self.lkas_status_var = tk.StringVar(value='○ idle')
         self.lkas_status_lbl = ttk.Label(feats, textvariable=self.lkas_status_var,
                                           foreground='#888888', width=12)
-        self.lkas_status_lbl.grid(row=1, column=1, sticky='w', padx=(6, 0))
+        self.lkas_status_lbl.grid(row=3, column=1, sticky='w', padx=(6, 0))
 
         # Recorder. Writes whatever the camera widget is currently showing
         # (active source, decoded once per render tick) to a timestamped
@@ -1065,11 +1130,16 @@ class ADASUI:
         cmd = [str(CARLA_PYTHON), str(BRIDGE_SCRIPT),
                '--junction-policy', policy,
                '--spawn-index', spawn_index]
+        # Append --record only when the checkbox is ticked. Bridge defaults
+        # to no recording (opt-in), so silence == no bag on disk.
+        if self.rosbag_record_var.get():
+            cmd.append('--record')
         self._log(f'$ (source ROS && cd {BRIDGE_DIR} && {" ".join(cmd)})')
         self.bridge_proc = self._popen(cmd, cwd=str(BRIDGE_DIR),
                                         source_ros=True, prefix='bridge')
+        rec_note = ' + rosbag' if self.rosbag_record_var.get() else ''
         self.status_var.set(
-            f'Bridge starting (spawn={spawn_index}, junction: {policy})')
+            f'Bridge starting (spawn={spawn_index}, junction: {policy}{rec_note})')
 
     def stop_bridge(self):
         self._terminate(self.bridge_proc, 'Bridge')
@@ -1145,9 +1215,18 @@ class ADASUI:
             self.acc_on = False
             self._log('[ui] ACC OFF')
         else:
+            # Look up the selected YOLO checkpoint in OBJECT_MODELS and
+            # pass it to perception_node as -p model_filename:=<ref>.
+            perc_cmd = ['ros2', 'run', 'perception', 'perception_node']
+            model_ref = next((ref for name, ref in OBJECT_MODELS
+                              if name == self.object_model_var.get()), None)
+            if model_ref:
+                perc_cmd += ['--ros-args', '-p',
+                             f'model_filename:={model_ref}']
+                self._log(f'[ui] ACC model: {self.object_model_var.get()}')
             self.acc_procs.append(self._popen(
-                ['ros2', 'run', 'perception', 'perception_node'],
-                cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
+                perc_cmd, cwd=str(ADAS_WK),
+                source_ros=True, source_workspace=True,
                 prefix='acc-perc'))
             self.acc_procs.append(self._popen(
                 ['ros2', 'run', 'controller', 'controller_node',
@@ -1167,9 +1246,21 @@ class ADASUI:
             self.lkas_on = False
             self._log('[ui] LKAS OFF')
         else:
+            # Look up the selected model in LANE_MODELS and pass it
+            # to lane_detection_node. If the entry is missing (dropdown
+            # value doesn't match any option — shouldn't happen since
+            # it's readonly), we omit the flag and the node falls back
+            # to its own default.
+            perc_cmd = ['ros2', 'run', 'perception', 'lane_detection_node']
+            model_ref = next((ref for name, ref in LANE_MODELS
+                              if name == self.lane_model_var.get()), None)
+            if model_ref:
+                perc_cmd += ['--ros-args', '-p',
+                             f'model_filename:={model_ref}']
+                self._log(f'[ui] LKAS model: {self.lane_model_var.get()}')
             self.lkas_procs.append(self._popen(
-                ['ros2', 'run', 'perception', 'lane_detection_node'],
-                cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
+                perc_cmd, cwd=str(ADAS_WK),
+                source_ros=True, source_workspace=True,
                 prefix='lkas-perc'))
             self.lkas_procs.append(self._popen(
                 ['ros2', 'run', 'controller', 'stanley_node'],
